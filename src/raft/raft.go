@@ -205,6 +205,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.dprint("Handle AppendEntries from leader %d", args.LeaderId)
 
+	rf.resetLastHeard()
 	reply.Term = rf.currentTerm
 
 	if args.Term < rf.currentTerm {
@@ -221,7 +222,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.leader = args.LeaderId
 	rf.lastHeardTime = time.Now()
-	rf.resetLastHeard()
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -398,6 +398,13 @@ func (rf *Raft) dprint(format string, a ...interface{}) {
 	DPrintf("[%d, %d] "+format, append([]interface{}{rf.me, rf.currentTerm}, a...)...)
 }
 
+// locked version of dprint
+func (rf *Raft) ldprint(format string, a ...interface{}) {
+	rf.mu.Lock()
+	rf.dprint(format, a...)
+	rf.mu.Unlock()
+}
+
 func (rf *Raft) electionLoop() {
 	for !rf.killed() {
 
@@ -434,8 +441,6 @@ func (rf *Raft) electionLoop() {
 
 		rf.mu.Unlock()
 
-		voteCount := 1   // votes received
-		finishCount := 1 // goroutines completed
 		voteResultChan := make(chan *RequestVoteReply, len(rf.peers))
 
 		// send requests to all
@@ -453,47 +458,74 @@ func (rf *Raft) electionLoop() {
 			}(i)
 		}
 
-		maxTerm := 0
-
-		for voteResult := range voteResultChan {
-			// rf.dprint("Received Vote Resp")
-			finishCount += 1
-			if voteResult != nil {
-				if voteResult.VoteGranted {
-					voteCount += 1
-				}
-				// record max term
-				if voteResult.Term > maxTerm {
-					maxTerm = voteResult.Term
-				}
-			}
-			// if all send completes, or majority of votes has been received, end
-			if finishCount == len(rf.peers) || voteCount > len(rf.peers)/2 {
-				break
-			}
+		type Result struct {
+			finishCount int
+			voteCount   int
+			maxTerm     int
 		}
 
-		rf.mu.Lock()
+		resultChan := make(chan *Result, 1)
 
-		if rf.role != CANDIDATE {
+		go func() {
+			finishCount := 1
+			voteCount := 1
+			maxTerm := 0
+
+			for voteResult := range voteResultChan {
+				finishCount += 1
+				if voteResult != nil {
+					if voteResult.VoteGranted {
+						voteCount += 1
+					}
+					// record max term
+					if voteResult.Term > maxTerm {
+						maxTerm = voteResult.Term
+					}
+				}
+				// if all send completes, or majority of votes has been received, end
+				if finishCount == len(rf.peers) || voteCount > len(rf.peers)/2 {
+					break
+				}
+			}
+
+			resultChan <- &Result{
+				finishCount: finishCount,
+				voteCount:   voteCount,
+				maxTerm:     maxTerm,
+			}
+		}()
+
+		var result *Result
+
+		select {
+		case r := <-resultChan:
+			result = r
+			rf.ldprint("Election completed")
+		case <-time.After(getElectionTimeout()):
+			rf.ldprint("Election timeout. Restart.")
+		}
+
+		if result != nil {
+			rf.mu.Lock()
+
+			if rf.role != CANDIDATE {
+				rf.mu.Unlock()
+				return
+			}
+
+			// received higher term, this vote should be ignored
+			if result.maxTerm > rf.currentTerm {
+				rf.toFollower(result.maxTerm)
+			}
+
+			if result.voteCount > len(rf.peers)/2 {
+				rf.dprint("Majority reached. Become leader.")
+				rf.toLeader()
+			} else {
+				rf.dprint("No majority reached. Restart election")
+			}
 			rf.mu.Unlock()
-			return
 		}
-
-		// received higher term, this vote should be ignored
-		if maxTerm > rf.currentTerm {
-			rf.toFollower(maxTerm)
-		}
-
-		if voteCount > len(rf.peers)/2 {
-			rf.dprint("Majority reached. Become leader.")
-			rf.toLeader()
-		} else {
-			rf.dprint("No majority reached. Restart election")
-
-		}
-
-		rf.mu.Unlock()
 	}
 
 }
