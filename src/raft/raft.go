@@ -235,8 +235,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// if log doesn't contain an entry at prevLogIndex, or
 	// if log contais the entry, but term doesn't matches prevLogTerm
 	// return false
-	// first index is 1
-	if len(rf.log) < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+
+	// Since there are a dummy log index 0 in each server,
+	// the index for each actual log matches the index of log in the array
+	// so, if args.PrevLogIndex == i, we should check if there are i+1 elements in the array
+	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 
 		rf.dprint("Log inconsistency. Rejected")
 
@@ -414,6 +417,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	rf.log = append(rf.log, log)
+
+	// update nextIndex for me
+	rf.nextIndex[rf.me] = log.Index + 1
+	rf.matchIndex[rf.me] = log.Index
 
 	rf.dprint("Created new log (%d, %d, %+v)", log.Index, log.Term, command)
 
