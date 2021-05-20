@@ -732,26 +732,22 @@ func (rf *Raft) applyUncommitedMessagesIfNeeded() {
 	// create a goroutine to commit them
 	if rf.commitIndex > rf.lastApplied {
 
+		// collect messages to apply
+		messages := make([]ApplyMsg, 0)
+
+		applyCh := rf.applyCh
+
+		for i, log := range rf.log[rf.lastApplied+1 : rf.commitIndex+1] {
+			rf.dprint("Add command %+v to apply", log.Command)
+			messages = append(messages, ApplyMsg{
+				CommandValid: true,
+				Command:      log.Command,
+				CommandIndex: rf.lastApplied + 1 + i,
+			})
+		}
+		rf.lastApplied = rf.commitIndex
+
 		go func() {
-
-			// collect messages to apply
-			messages := make([]ApplyMsg, 0)
-
-			rf.mu.Lock()
-
-			applyCh := rf.applyCh
-
-			for i, log := range rf.log[rf.lastApplied+1 : rf.commitIndex+1] {
-				rf.dprint("Add command %+v to apply", log.Command)
-				messages = append(messages, ApplyMsg{
-					CommandValid: true,
-					Command:      log.Command,
-					CommandIndex: rf.lastApplied + 1 + i,
-				})
-			}
-			rf.lastApplied = rf.commitIndex
-
-			rf.mu.Unlock()
 
 			// apply
 			for _, msg := range messages {
