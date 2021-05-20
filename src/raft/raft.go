@@ -643,13 +643,15 @@ func (rf *Raft) appendEntriesLoop() {
 				LeaderId:     rf.me,
 				Entries:      make([]Log, 0),
 				LeaderCommit: rf.commitIndex,
+				// even there is no new entries,
+				// set prevLogIndex and prevLogTerm to check for consistency
+				PrevLogIndex: rf.log[rf.nextIndex[i]-1].Index,
+				PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
 			}
 
 			if rf.lastLog().Index >= rf.nextIndex[i] {
 				rf.dprint("New entries to append for %d. %d >= %d", i, rf.lastLog().Index, rf.nextIndex[i])
 				args.Entries = rf.log[rf.nextIndex[i]:]
-				args.PrevLogIndex = rf.log[rf.nextIndex[i]-1].Index
-				args.PrevLogTerm = rf.log[rf.nextIndex[i]-1].Term
 			}
 
 			go func(i int) {
