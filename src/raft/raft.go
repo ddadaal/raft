@@ -247,6 +247,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	rf.dprint("%+v", args)
+
 	for i, log := range args.Entries {
 		// if rf.log doesn't contain log.Index, append the rest
 		// <= for the first log is 0
@@ -269,6 +271,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		}
 	}
+
+	rf.dprint("%+v", rf.log)
 
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = intMin(args.LeaderCommit, rf.lastLog().Index)
@@ -675,9 +679,9 @@ func (rf *Raft) appendEntriesLoop() {
 						}
 					}
 
-					N := rf.commitIndex + 1
+					N := len(rf.log) - 1
 
-					for ; N < len(rf.log); N++ {
+					for ; N >= rf.commitIndex+1; N-- {
 						// check if log[N].term == currentTerm
 						if rf.log[N].Term != rf.currentTerm {
 							continue
@@ -695,7 +699,7 @@ func (rf *Raft) appendEntriesLoop() {
 						}
 					}
 
-					if N < len(rf.log) {
+					if N >= rf.commitIndex+1 {
 						rf.commitIndex = N
 					}
 
