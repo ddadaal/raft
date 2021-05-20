@@ -498,7 +498,7 @@ func (rf *Raft) ldprint(format string, a ...interface{}) {
 func (rf *Raft) electionLoop() {
 	for !rf.killed() {
 
-		time.Sleep(1 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 
 		rf.mu.Lock()
 
@@ -622,6 +622,9 @@ func (rf *Raft) electionLoop() {
 
 func (rf *Raft) appendEntriesLoop() {
 	for !rf.killed() {
+
+		time.Sleep(10 * time.Millisecond)
+
 		rf.mu.Lock()
 
 		if rf.role != LEADER {
