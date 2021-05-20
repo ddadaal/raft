@@ -18,14 +18,13 @@ package raft
 //
 
 import (
-	//	"bytes"
-
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -136,12 +135,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -153,17 +153,20 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var currentTerm int
+	var votedFor int
+	var log []Log
+
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		panic("Error during readPersist.")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 //
@@ -274,6 +277,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
+	rf.persist()
+
 	rf.dprint("%+v", rf.log)
 
 	if args.LeaderCommit > rf.commitIndex {
@@ -348,6 +353,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.CandidateId
 			rf.role = FOLLOWER
 			rf.resetLastHeard()
+			rf.persist()
 		} else {
 			rf.dprint("Reject RequestVote from %d due to not update", args.CandidateId)
 		}
@@ -426,6 +432,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.log = append(rf.log, log)
 
+	rf.persist()
+
 	// update nextIndex for me
 	rf.nextIndex[rf.me] = log.Index + 1
 	rf.matchIndex[rf.me] = log.Index
@@ -478,6 +486,8 @@ func (rf *Raft) toFollower(term int) {
 	rf.currentTerm = term
 	rf.votedFor = -1
 	rf.leader = -1
+
+	rf.persist()
 }
 
 func getElectionTimeout() time.Duration {
@@ -517,6 +527,7 @@ func (rf *Raft) electionLoop() {
 		rf.currentTerm++
 		rf.votedFor = rf.me
 		rf.resetLastHeard()
+		rf.persist()
 
 		rf.dprint("Start requesting votes for term %d", rf.currentTerm)
 
