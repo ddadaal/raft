@@ -232,24 +232,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.leader = args.LeaderId
 
-	// if it's heartbeat, return
-	if len(args.Entries) == 0 {
-		reply.Success = true
-		return
-	}
-
 	// if log doesn't contain an entry at prevLogIndex, or
 	// if log contais the entry, but term doesn't matches prevLogTerm
 	// return false
 	// first index is 1
-	if len(rf.log) < args.PrevLogIndex || rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+	if len(rf.log) < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+
+		rf.dprint("Log inconsistency. Rejected")
+
 		reply.Success = false
 		return
 	}
 
 	for i, log := range args.Entries {
 		// if rf.log doesn't contain log.Index, append the rest
-		if len(rf.log) < log.Index {
+		// <= for the first log is 0
+		// if the latest rf.log has index 1, the len(rf.log) is 2, but log has index 2
+		if len(rf.log) <= log.Index {
 			rf.log = append(rf.log, args.Entries[i:]...)
 			break
 		} else {
@@ -409,12 +408,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Create the log entry
 	log := Log{
-		Index:   len(rf.log) + 1,
+		Index:   len(rf.log),
 		Term:    rf.currentTerm,
 		Command: command,
 	}
 
 	rf.log = append(rf.log, log)
+
+	rf.dprint("Created new log (%d, %d, %+v)", log.Index, log.Term, command)
 
 	return log.Index, log.Term, true
 }
@@ -620,8 +621,6 @@ func (rf *Raft) appendEntriesLoop() {
 
 		rf.lastBroadcastTime = time.Now()
 
-		lastLog := rf.lastLog()
-
 		for i := range rf.peers {
 			if i == rf.me {
 				continue
@@ -630,14 +629,15 @@ func (rf *Raft) appendEntriesLoop() {
 			args := AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
-				PrevLogIndex: lastLog.Index,
-				PrevLogTerm:  lastLog.Term,
 				Entries:      make([]Log, 0),
 				LeaderCommit: rf.commitIndex,
 			}
 
 			if rf.lastLog().Index >= rf.nextIndex[i] {
+				rf.dprint("New entries to append for %d. %d >= %d", i, rf.lastLog().Index, rf.nextIndex[i])
 				args.Entries = rf.log[rf.nextIndex[i]:]
+				args.PrevLogIndex = rf.log[rf.nextIndex[i]-1].Index
+				args.PrevLogTerm = rf.log[rf.nextIndex[i]-1].Term
 			}
 
 			go func(i int) {
@@ -703,6 +703,39 @@ func (rf *Raft) appendEntriesLoop() {
 	}
 }
 
+func (rf *Raft) applyMessagesLoop(applyCh chan ApplyMsg) {
+	for !rf.killed() {
+
+		time.Sleep(100 * time.Millisecond)
+
+		// collect messages to apply
+		messages := make([]ApplyMsg, 0)
+
+		rf.mu.Lock()
+
+		// if there are uncommitted messages, apply them
+		if rf.commitIndex > rf.lastApplied {
+			for i, log := range rf.log[rf.lastApplied+1 : rf.commitIndex+1] {
+				rf.dprint("Add command %+v to apply", log.Command)
+				messages = append(messages, ApplyMsg{
+					CommandValid: true,
+					Command:      log.Command,
+					CommandIndex: rf.lastApplied + 1 + i,
+				})
+			}
+			rf.lastApplied = rf.commitIndex
+		}
+
+		rf.mu.Unlock()
+
+		// apply
+		for _, msg := range messages {
+			applyCh <- msg
+		}
+
+	}
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -737,6 +770,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.electionLoop()
 	// leader
 	go rf.appendEntriesLoop()
+
+	go rf.applyMessagesLoop(applyCh)
 
 	return rf
 }
