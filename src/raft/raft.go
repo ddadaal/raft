@@ -107,6 +107,8 @@ type Raft struct {
 	electionTimeoutTime time.Time
 
 	lastBroadcastTime time.Time
+
+	applyCh chan ApplyMsg
 }
 
 func (rf *Raft) resetLastHeard() {
@@ -276,6 +278,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = intMin(args.LeaderCommit, rf.lastLog().Index)
+		rf.applyUncommitedMessagesIfNeeded()
 	}
 
 	reply.Success = true
@@ -704,6 +707,7 @@ func (rf *Raft) appendEntriesLoop() {
 
 					if N >= rf.commitIndex+1 {
 						rf.commitIndex = N
+						rf.applyUncommitedMessagesIfNeeded()
 					}
 
 					rf.mu.Unlock()
@@ -715,20 +719,25 @@ func (rf *Raft) appendEntriesLoop() {
 		rf.mu.Unlock()
 
 	}
+
 }
 
-func (rf *Raft) applyMessagesLoop(applyCh chan ApplyMsg) {
-	for !rf.killed() {
+// requires lock
+func (rf *Raft) applyUncommitedMessagesIfNeeded() {
 
-		time.Sleep(100 * time.Millisecond)
+	// if there are uncommitted messages,
+	// create a goroutine to commit them
+	if rf.commitIndex > rf.lastApplied {
 
-		// collect messages to apply
-		messages := make([]ApplyMsg, 0)
+		go func() {
 
-		rf.mu.Lock()
+			// collect messages to apply
+			messages := make([]ApplyMsg, 0)
 
-		// if there are uncommitted messages, apply them
-		if rf.commitIndex > rf.lastApplied {
+			rf.mu.Lock()
+
+			applyCh := rf.applyCh
+
 			for i, log := range rf.log[rf.lastApplied+1 : rf.commitIndex+1] {
 				rf.dprint("Add command %+v to apply", log.Command)
 				messages = append(messages, ApplyMsg{
@@ -738,15 +747,14 @@ func (rf *Raft) applyMessagesLoop(applyCh chan ApplyMsg) {
 				})
 			}
 			rf.lastApplied = rf.commitIndex
-		}
 
-		rf.mu.Unlock()
+			rf.mu.Unlock()
 
-		// apply
-		for _, msg := range messages {
-			applyCh <- msg
-		}
-
+			// apply
+			for _, msg := range messages {
+				applyCh <- msg
+			}
+		}()
 	}
 }
 
@@ -774,6 +782,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.log = []Log{{Term: 0, Index: 0}}
 	rf.leader = -1
+	rf.applyCh = applyCh
 
 	rf.resetLastHeard()
 
@@ -784,8 +793,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.electionLoop()
 	// leader
 	go rf.appendEntriesLoop()
-
-	go rf.applyMessagesLoop(applyCh)
 
 	return rf
 }
