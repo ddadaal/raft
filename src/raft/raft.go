@@ -336,17 +336,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	lastLog := rf.lastLog()
 
-	uptodate := (args.LastLogTerm > lastLog.Term) || (args.LastLogTerm == lastLog.Term && args.LastLogIndex >= lastLog.Index)
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		uptodate := (args.LastLogTerm > lastLog.Term) || (args.LastLogTerm == lastLog.Term && args.LastLogIndex >= lastLog.Index)
 
-	if !uptodate {
-		rf.dprint("Reject RequestVote from %d due to not update", args.CandidateId)
-	} else if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		rf.dprint("Granted RequestVote from %d", args.CandidateId)
-
-		reply.VoteGranted = true
-		rf.votedFor = args.CandidateId
-		rf.role = FOLLOWER
-		rf.resetLastHeard()
+		if uptodate {
+			rf.dprint("Granted RequestVote from %d", args.CandidateId)
+			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
+			rf.role = FOLLOWER
+			rf.resetLastHeard()
+		} else {
+			rf.dprint("Reject RequestVote from %d due to not update", args.CandidateId)
+		}
 
 	} else {
 		rf.dprint("Reject RequestVote from %d. Has voted %d for term %d.", args.CandidateId, rf.votedFor, args.Term)
