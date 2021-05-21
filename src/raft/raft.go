@@ -203,6 +203,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	ConflictingEntryTerm int
+	FirstIndexForTerm    int
 }
 
 func intMin(a int, b int) int {
@@ -225,6 +228,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.Term < rf.currentTerm {
 		reply.Success = false
+		reply.ConflictingEntryTerm = -1
+		reply.FirstIndexForTerm = -1
 		rf.dprint("Incoming AppendEntries has lower term %d < %d. Rejected.", args.Term, rf.currentTerm)
 		return
 	}
@@ -236,6 +241,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	rf.leader = args.LeaderId
+
+	//
+	// 0 1 1 1 1 1 4
+	// 0 1 2 2
 
 	// if log doesn't contain an entry at prevLogIndex, or
 	// if log contais the entry, but term doesn't matches prevLogTerm
@@ -249,6 +258,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.dprint("Log inconsistency. Rejected")
 
 		reply.Success = false
+
+		if len(rf.log) <= args.PrevLogIndex {
+			// if log doesn't have such key,
+			// return the latest log's index + 1 (next position)
+			reply.ConflictingEntryTerm = -1
+			reply.FirstIndexForTerm = rf.lastLog().Index + 1
+
+		} else {
+			// has such key,but term doesn't match
+			reply.ConflictingEntryTerm = rf.log[args.PrevLogIndex].Term
+			reply.FirstIndexForTerm = args.PrevLogIndex
+
+			// find the first key of that term
+			for ; reply.FirstIndexForTerm >= 1 && rf.log[reply.FirstIndexForTerm-1].Term == reply.ConflictingEntryTerm; reply.FirstIndexForTerm-- {
+
+			}
+		}
+
 		return
 	}
 
@@ -609,21 +636,22 @@ func (rf *Raft) electionLoop() {
 		if result != nil {
 			rf.mu.Lock()
 
-			if rf.role != CANDIDATE {
+			// if role or term changes, ignore result
+			if rf.role != CANDIDATE || rf.currentTerm != args.Term {
 				rf.mu.Unlock()
-				return
+				continue
 			}
 
 			// received higher term, this vote should be ignored
 			if result.maxTerm > rf.currentTerm {
 				rf.toFollower(result.maxTerm)
-			}
-
-			if result.voteCount > len(rf.peers)/2 {
-				rf.dprint("Majority reached. Become leader.")
-				rf.toLeader()
 			} else {
-				rf.dprint("No majority reached. Restart election")
+				if result.voteCount > len(rf.peers)/2 {
+					rf.dprint("Majority reached. Become leader.")
+					rf.toLeader()
+				} else {
+					rf.dprint("No majority reached. Restart election")
+				}
 			}
 			rf.mu.Unlock()
 		}
@@ -690,38 +718,56 @@ func (rf *Raft) appendEntriesLoop() {
 						return
 					}
 
+					// if rf is not leader or term has changed, ignore
+					if rf.role != LEADER || rf.currentTerm != args.Term {
+						rf.mu.Unlock()
+						return
+					}
+
 					if reply.Success {
 						rf.nextIndex[i] = args.Entries[len(args.Entries)-1].Index + 1
 						rf.matchIndex[i] = rf.nextIndex[i] - 1
-					} else {
-						if rf.nextIndex[i] > 1 {
-							rf.nextIndex[i]--
-						}
-					}
+						N := len(rf.log) - 1
 
-					N := len(rf.log) - 1
+						for ; N >= rf.commitIndex+1; N-- {
+							// check if log[N].term == currentTerm
+							if rf.log[N].Term != rf.currentTerm {
+								continue
+							}
 
-					for ; N >= rf.commitIndex+1; N-- {
-						// check if log[N].term == currentTerm
-						if rf.log[N].Term != rf.currentTerm {
-							continue
-						}
-
-						// check if a majority of matchIndex[i] > N
-						count := 0
-						for i := range rf.matchIndex {
-							if rf.matchIndex[i] >= N {
-								count++
+							// check if a majority of matchIndex[i] > N
+							count := 0
+							for i := range rf.matchIndex {
+								if rf.matchIndex[i] >= N {
+									count++
+								}
+							}
+							if count > len(rf.matchIndex)/2 {
+								break
 							}
 						}
-						if count > len(rf.matchIndex)/2 {
-							break
-						}
-					}
 
-					if N >= rf.commitIndex+1 {
-						rf.commitIndex = N
-						rf.applyUncommitedMessagesIfNeeded()
+						if N >= rf.commitIndex+1 {
+							rf.commitIndex = N
+							rf.applyUncommitedMessagesIfNeeded()
+						}
+					} else {
+
+						// if rejected
+
+						// if ConflictingEntryTerm is set
+						if reply.ConflictingEntryTerm != -1 {
+							// term conflict, remove all the entries
+							rf.nextIndex[i] = reply.FirstIndexForTerm
+						} else {
+							// doesn't have the key
+							if reply.FirstIndexForTerm != -1 {
+								rf.nextIndex[i] = reply.FirstIndexForTerm
+							} else {
+								// the rf should be follower now
+							}
+
+						}
 					}
 
 					rf.mu.Unlock()
