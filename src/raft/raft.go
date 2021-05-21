@@ -377,10 +377,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if uptodate {
 			rf.dprint("Granted RequestVote from %d", args.CandidateId)
 			reply.VoteGranted = true
+
 			rf.votedFor = args.CandidateId
-			rf.role = FOLLOWER
-			rf.resetLastHeard()
 			rf.persist()
+
+			rf.role = FOLLOWER
+
+			rf.resetLastHeard()
 		} else {
 			rf.dprint("Reject RequestVote from %d due to not update", args.CandidateId)
 		}
@@ -494,9 +497,6 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) toLeader() {
 	rf.role = LEADER
 
-	// reset lastBroadcast to broadcast immediately
-	rf.lastBroadcastTime = time.Unix(0, 0)
-
 	// reset volatile states
 	rf.nextIndex = make([]int, len(rf.peers))
 
@@ -506,15 +506,20 @@ func (rf *Raft) toLeader() {
 	}
 
 	rf.matchIndex = make([]int, len(rf.peers))
+
+	// broadcast immediately
+	rf.broadcast(true)
 }
 
 func (rf *Raft) toFollower(term int) {
 	rf.role = FOLLOWER
+
 	rf.currentTerm = term
 	rf.votedFor = -1
+	rf.persist()
+
 	rf.leader = -1
 
-	rf.persist()
 }
 
 func getElectionTimeout() time.Duration {
@@ -553,8 +558,11 @@ func (rf *Raft) electionLoop() {
 		rf.role = CANDIDATE
 		rf.currentTerm++
 		rf.votedFor = rf.me
-		rf.resetLastHeard()
 		rf.persist()
+
+		rf.resetLastHeard()
+
+		timeout := rf.electionTimeoutTime
 
 		rf.dprint("Start requesting votes for term %d", rf.currentTerm)
 
@@ -629,7 +637,7 @@ func (rf *Raft) electionLoop() {
 		case r := <-resultChan:
 			result = r
 			rf.ldprint("Election completed")
-		case <-time.After(getElectionTimeout()):
+		case <-time.After(time.Until(timeout)):
 			rf.ldprint("Election timeout. Restart.")
 		}
 
@@ -659,6 +667,112 @@ func (rf *Raft) electionLoop() {
 
 }
 
+// requires lock
+func (rf *Raft) broadcast(empty bool) {
+
+	rf.lastBroadcastTime = time.Now()
+
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+
+		args := AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			Entries:      make([]Log, 0),
+			LeaderCommit: rf.commitIndex,
+			// even there is no new entries,
+			// set prevLogIndex and prevLogTerm to check for consistency
+			PrevLogIndex: rf.log[rf.nextIndex[i]-1].Index,
+			PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
+		}
+
+		if !empty && rf.lastLog().Index >= rf.nextIndex[i] {
+			rf.dprint("New entries to append for %d. %d >= %d", i, rf.lastLog().Index, rf.nextIndex[i])
+			args.Entries = rf.log[rf.nextIndex[i]:]
+		}
+
+		go func(i int) {
+			reply := AppendEntriesReply{}
+			if ok := rf.sendAppendEntries(i, &args, &reply); ok {
+				rf.mu.Lock()
+
+				if reply.Term > rf.currentTerm {
+					rf.dprint("Received reply with higher term %d > %d. To follower", reply.Term, rf.currentTerm)
+					rf.toFollower(reply.Term)
+
+					rf.mu.Unlock()
+					return
+				}
+
+				// is heartbeat, ignore
+				// if len(args.Entries) == 0 {
+				// 	rf.mu.Unlock()
+				// 	return
+				// }
+
+				// if rf is not leader or term has changed, ignore
+				if rf.role != LEADER || rf.currentTerm != args.Term {
+					rf.mu.Unlock()
+					return
+				}
+
+				if reply.Success {
+					if len(args.Entries) > 0 {
+						rf.nextIndex[i] = args.Entries[len(args.Entries)-1].Index + 1
+						rf.matchIndex[i] = rf.nextIndex[i] - 1
+					}
+					N := len(rf.log) - 1
+
+					for ; N >= rf.commitIndex+1; N-- {
+						// check if log[N].term == currentTerm
+						if rf.log[N].Term != rf.currentTerm {
+							continue
+						}
+
+						// check if a majority of matchIndex[i] > N
+						count := 0
+						for i := range rf.matchIndex {
+							if rf.matchIndex[i] >= N {
+								count++
+							}
+						}
+						if count > len(rf.matchIndex)/2 {
+							break
+						}
+					}
+
+					if N >= rf.commitIndex+1 {
+						rf.commitIndex = N
+						rf.applyUncommitedMessagesIfNeeded()
+					}
+				} else {
+
+					// if rejected
+
+					// if ConflictingEntryTerm is set
+					if reply.ConflictingEntryTerm != -1 {
+						// term conflict, remove all the entries
+						rf.nextIndex[i] = reply.FirstIndexForTerm
+					} else {
+						// doesn't have the key
+						if reply.FirstIndexForTerm != -1 {
+							rf.nextIndex[i] = reply.FirstIndexForTerm
+						} else {
+							// the rf should be follower now
+						}
+
+					}
+				}
+
+				rf.mu.Unlock()
+			}
+		}(i)
+
+	}
+}
+
 func (rf *Raft) appendEntriesLoop() {
 	for !rf.killed() {
 
@@ -676,105 +790,7 @@ func (rf *Raft) appendEntriesLoop() {
 			continue
 		}
 
-		rf.lastBroadcastTime = time.Now()
-
-		for i := range rf.peers {
-			if i == rf.me {
-				continue
-			}
-
-			args := AppendEntriesArgs{
-				Term:         rf.currentTerm,
-				LeaderId:     rf.me,
-				Entries:      make([]Log, 0),
-				LeaderCommit: rf.commitIndex,
-				// even there is no new entries,
-				// set prevLogIndex and prevLogTerm to check for consistency
-				PrevLogIndex: rf.log[rf.nextIndex[i]-1].Index,
-				PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
-			}
-
-			if rf.lastLog().Index >= rf.nextIndex[i] {
-				rf.dprint("New entries to append for %d. %d >= %d", i, rf.lastLog().Index, rf.nextIndex[i])
-				args.Entries = rf.log[rf.nextIndex[i]:]
-			}
-
-			go func(i int) {
-				reply := AppendEntriesReply{}
-				if ok := rf.sendAppendEntries(i, &args, &reply); ok {
-					rf.mu.Lock()
-
-					if reply.Term > rf.currentTerm {
-						rf.dprint("Received reply with higher term %d > %d. To follower", reply.Term, rf.currentTerm)
-						rf.toFollower(reply.Term)
-
-						rf.mu.Unlock()
-						return
-					}
-
-					// is heartbeat, ignore
-					if len(args.Entries) == 0 {
-						rf.mu.Unlock()
-						return
-					}
-
-					// if rf is not leader or term has changed, ignore
-					if rf.role != LEADER || rf.currentTerm != args.Term {
-						rf.mu.Unlock()
-						return
-					}
-
-					if reply.Success {
-						rf.nextIndex[i] = args.Entries[len(args.Entries)-1].Index + 1
-						rf.matchIndex[i] = rf.nextIndex[i] - 1
-						N := len(rf.log) - 1
-
-						for ; N >= rf.commitIndex+1; N-- {
-							// check if log[N].term == currentTerm
-							if rf.log[N].Term != rf.currentTerm {
-								continue
-							}
-
-							// check if a majority of matchIndex[i] > N
-							count := 0
-							for i := range rf.matchIndex {
-								if rf.matchIndex[i] >= N {
-									count++
-								}
-							}
-							if count > len(rf.matchIndex)/2 {
-								break
-							}
-						}
-
-						if N >= rf.commitIndex+1 {
-							rf.commitIndex = N
-							rf.applyUncommitedMessagesIfNeeded()
-						}
-					} else {
-
-						// if rejected
-
-						// if ConflictingEntryTerm is set
-						if reply.ConflictingEntryTerm != -1 {
-							// term conflict, remove all the entries
-							rf.nextIndex[i] = reply.FirstIndexForTerm
-						} else {
-							// doesn't have the key
-							if reply.FirstIndexForTerm != -1 {
-								rf.nextIndex[i] = reply.FirstIndexForTerm
-							} else {
-								// the rf should be follower now
-							}
-
-						}
-					}
-
-					rf.mu.Unlock()
-				}
-			}(i)
-
-		}
+		rf.broadcast(false)
 
 		rf.mu.Unlock()
 
@@ -790,7 +806,7 @@ func (rf *Raft) applyUncommitedMessagesIfNeeded() {
 	if rf.commitIndex > rf.lastApplied {
 
 		// collect messages to apply
-		messages := make([]ApplyMsg, 0)
+		messages := make([]ApplyMsg, rf.commitIndex-rf.lastApplied)
 
 		applyCh := rf.applyCh
 
