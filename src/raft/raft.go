@@ -38,9 +38,7 @@ const (
 
 const HEARTBEAT_INTERVAL = 100
 
-// smaller timeout doesn't pass tests
-// wtf
-const ELECTION_TIMEOUT_MIN = 300
+const ELECTION_TIMEOUT_MIN = 250
 const ELECTION_TIMEOUT_MAX = 400
 
 type Log struct {
