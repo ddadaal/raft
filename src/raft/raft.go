@@ -290,7 +290,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			break
 		} else {
 			// rf.log has the same index
-			existing := rf.log[log.Index-1]
+			existing := rf.log[log.Index]
 
 			if existing.Term == log.Term {
 				// ignore the entry, continue loop
