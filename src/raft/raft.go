@@ -202,6 +202,9 @@ func (rf *Raft) readPersist(data []byte) {
 		panic("Error during readPersist.")
 	}
 
+	rf.lastApplied = rf.snapshotLastIndex
+	rf.commitIndex = rf.snapshotLastIndex
+
 }
 
 //
@@ -245,14 +248,15 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		rf.dprint("No log with index %d is found. Removing all logs", index)
 		rf.log = []Log{firstElement}
 		rf.snapshotLastIndex = index
-		rf.lastApplied = index
 	} else {
 		rf.dprint("Removing logs until index %d", index)
 		rf.snapshotLastIndex = rf.log[i].Index
 		rf.snapshotLastTerm = rf.log[i].Term
 		rf.log = append([]Log{firstElement}, rf.log[i+1:]...)
-		rf.lastApplied = intMax(rf.lastApplied, index)
 	}
+
+	rf.lastApplied = index
+	rf.commitIndex = index
 
 	rf.persist()
 	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
@@ -284,6 +288,15 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return
 	}
 
+	if args.Term > rf.currentTerm {
+		rf.toFollower(args.Term)
+	}
+
+	if args.LastIncludedIndex < rf.snapshotLastIndex {
+		rf.dprint("Received a outdated snapshot. Last index %d < %d", args.LastIncludedIndex, rf.snapshotLastIndex)
+		return
+	}
+
 	// find the index from the back
 	i := 0
 	for ; i >= 0; i-- {
@@ -294,18 +307,28 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	firstElement := rf.log[0]
 	if i <= 0 {
-		rf.dprint("Log with index %d is not found. Removing all logs.", args.LastIncludedIndex)
-		rf.snapshotLastIndex = args.LastIncludedIndex
-		rf.snapshotLastTerm = args.LastIncludedTerm
-		rf.log = []Log{firstElement}
-		rf.lastApplied = args.LastIncludedIndex
+		if rf.snapshotLastIndex == args.LastIncludedIndex {
+			if rf.snapshotLastTerm == args.LastIncludedTerm {
+				rf.dprint("The snapshot to %d is already taken.", rf.snapshotLastIndex)
+			} else {
+				rf.dprint("Snapshot index matches, but term doesn't match.")
+				panic("shouldn't happen for now")
+			}
+		} else {
+			rf.dprint("Log with index %d is not found. Removing all logs.", args.LastIncludedIndex)
+			rf.snapshotLastIndex = args.LastIncludedIndex
+			rf.snapshotLastTerm = args.LastIncludedTerm
+			rf.log = []Log{firstElement}
+		}
 	} else {
 		rf.dprint("Removing logs until index %d", args.LastIncludedIndex)
 		rf.snapshotLastIndex = rf.log[i].Index
 		rf.snapshotLastTerm = rf.log[i].Term
 		rf.log = append([]Log{firstElement}, rf.log[i+1:]...)
-		rf.lastApplied = intMax(rf.lastApplied, args.LastIncludedIndex)
 	}
+
+	rf.lastApplied = args.LastIncludedIndex
+	rf.commitIndex = args.LastIncludedIndex
 
 	go func() {
 		rf.applyCh <- ApplyMsg{
@@ -316,6 +339,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			SnapshotIndex: args.LastIncludedIndex,
 		}
 	}()
+
+	rf.dprint("Snapshot installed to %d", args.LastIncludedIndex)
 
 	rf.persist()
 	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), args.Data)
@@ -449,6 +474,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// if the latest rf.log has index 1, the len(rf.log) is 2, but log has index 2
 		if len(rf.log)+rf.snapshotLastIndex <= log.Index {
 			rf.log = append(rf.log, args.Entries[i:]...)
+			rf.persist()
 			break
 		} else {
 			// rf.log has the same index
@@ -461,12 +487,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.log = rf.log[:log.Index-rf.snapshotLastIndex]
 				// append the rest
 				rf.log = append(rf.log, args.Entries[i:]...)
+				rf.persist()
 				break
 			}
 		}
 	}
-
-	rf.persist()
 
 	// rf.dprint("%+v", rf.log)
 
@@ -862,15 +887,14 @@ func (rf *Raft) broadcast(empty bool) {
 					}
 
 					rf.nextIndex[i] = lastIncludedIndex + 1
+					rf.matchIndex[i] = lastIncludedIndex
 					rf.mu.Unlock()
 				}
 			}(i)
-			return
+			continue
 		}
 
 		prevLog := rf.prevLogInfo(rf.nextIndex[i])
-
-		rf.dprint("%+v", prevLog)
 
 		args := AppendEntriesArgs{
 			Term:         rf.currentTerm,
