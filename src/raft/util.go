@@ -1,7 +1,7 @@
 package raft
 
 import (
-	"log"
+	"fmt"
 	"time"
 )
 
@@ -13,9 +13,8 @@ const Debug = true
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 
 	if Debug {
-		log.SetFlags(0)
-		log.SetPrefix(time.Now().Format("15:04:05.000") + " ")
-		log.Printf(format, a...)
+		now := time.Now().Format("15:04:05.000")
+		fmt.Printf(now+format+"\n", a...)
 	}
 	return
 }
