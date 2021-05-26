@@ -41,6 +41,8 @@ const HEARTBEAT_INTERVAL = 100
 const ELECTION_TIMEOUT_MIN = 250
 const ELECTION_TIMEOUT_MAX = 400
 
+const SNAPSHOT_LOG_SIZE = 10
+
 type Log struct {
 	Term    int
 	Index   int
@@ -106,6 +108,10 @@ type Raft struct {
 	lastBroadcastTime time.Time
 
 	applyCh chan ApplyMsg
+
+	// snapshots
+	snapshotLastTerm  int
+	snapshotLastIndex int
 }
 
 func (rf *Raft) resetLastHeard() {
@@ -113,8 +119,39 @@ func (rf *Raft) resetLastHeard() {
 	rf.electionTimeoutTime = rf.lastHeardTime.Add(getElectionTimeout())
 }
 
-func (rf *Raft) lastLog() *Log {
-	return &rf.log[len(rf.log)-1]
+type PrevLogInfo struct {
+	Index int
+	Term  int
+}
+
+func (rf *Raft) lastLog() PrevLogInfo {
+	if len(rf.log) > 1 {
+		lastLog := rf.log[len(rf.log)-1]
+		return PrevLogInfo{
+			Index: lastLog.Index,
+			Term:  lastLog.Term,
+		}
+	} else {
+		return PrevLogInfo{
+			Index: rf.snapshotLastIndex,
+			Term:  rf.snapshotLastTerm,
+		}
+	}
+}
+func (rf *Raft) prevLogInfo(indexPreviousOf int) PrevLogInfo {
+	actualIndex := indexPreviousOf - rf.snapshotLastIndex
+	if actualIndex == 1 {
+		return PrevLogInfo{
+			Index: rf.snapshotLastIndex,
+			Term:  rf.snapshotLastTerm,
+		}
+	} else {
+		lastLog := rf.log[actualIndex-1]
+		return PrevLogInfo{
+			Index: lastLog.Index,
+			Term:  lastLog.Term,
+		}
+	}
 }
 
 // return currentTerm and whether this server
@@ -175,7 +212,10 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 
 	// Your code here (2D).
 
-	return true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return rf.snapshotLastIndex <= lastIncludedIndex && rf.snapshotLastTerm <= lastIncludedTerm
 }
 
 // the service says it has created a snapshot that has
@@ -185,6 +225,92 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.dprint("Having snapshot to index %d", index)
+
+	// find the index from the back
+	i := len(rf.log) - 1
+	for ; i > 0; i-- {
+		if rf.log[i].Index == index {
+			break
+		}
+	}
+
+	if i == 0 {
+		rf.dprint("No log with index %d is found. ", index)
+		return
+	}
+
+	rf.dprint("Removing logs until index %d", index)
+
+	rf.snapshotLastIndex = rf.log[i].Index
+	rf.snapshotLastTerm = rf.log[i].Term
+
+	// the first element should be preserved
+	firstElement := rf.log[0]
+	rf.log = rf.log[i+1:]
+	rf.log = append([]Log{firstElement}, rf.log...)
+
+}
+
+// InstallSnapshot
+type InstallSnapshotArgs struct {
+	term              int
+	leaderId          int
+	lastIncludedIndex int
+	lastIncludedTerm  int
+	data              []byte
+}
+
+type InstallSnapshotReply struct {
+	term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.term = rf.currentTerm
+	rf.resetLastHeard()
+
+	if args.term < rf.currentTerm {
+		return
+	}
+
+	// find the index from the back
+	i := 0
+	for ; i >= 0; i-- {
+		if rf.log[i].Index == args.lastIncludedIndex {
+			break
+		}
+	}
+
+	if i <= 0 {
+		rf.dprint("No log with index %d is found. ", args.lastIncludedIndex)
+		return
+	}
+
+	rf.dprint("Removing logs until index %d", args.lastIncludedIndex)
+
+	rf.snapshotLastIndex = rf.log[i].Index
+	rf.snapshotLastTerm = rf.log[i].Term
+	rf.log = rf.log[i+1:]
+
+	rf.applyCh <- ApplyMsg{
+		CommandValid:  false,
+		SnapshotValid: true,
+		Snapshot:      args.data,
+		SnapshotTerm:  args.lastIncludedTerm,
+		SnapshotIndex: args.lastIncludedIndex,
+	}
+
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
 }
 
 // AppendEntries
@@ -219,7 +345,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.dprint("Handle AppendEntries from leader %d", args.LeaderId)
+	rf.dprint("Handle AppendEntries from leader %d. Log size %d", args.LeaderId, len(args.Entries))
 
 	rf.resetLastHeard()
 	reply.Term = rf.currentTerm
@@ -251,39 +377,54 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Since there are a dummy log index 0 in each server,
 	// the index for each actual log matches the index of log in the array
 	// so, if args.PrevLogIndex == i, we should check if there are i+1 elements in the array
-	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+
+	// if there are snapshot, add the length of snapshot
+
+	if len(rf.log)+rf.snapshotLastIndex <= args.PrevLogIndex {
+		rf.dprint("Doesn't have PrevLogIndex. Rejects")
+		reply.Success = false
+
+		// if log doesn't have such key,
+		// return the latest log's index + 1 (next position)
+		reply.ConflictingEntryTerm = -1
+		reply.FirstIndexForTerm = rf.lastLog().Index + 1
+		return
+	}
+
+	lastLogIndex := args.PrevLogIndex - rf.snapshotLastIndex
+
+	var lastLogTerm int
+	if lastLogIndex == 0 {
+		lastLogTerm = rf.snapshotLastTerm
+	} else {
+		lastLogTerm = rf.log[lastLogIndex].Term
+	}
+
+	if lastLogTerm != args.PrevLogTerm {
 
 		rf.dprint("Log inconsistency. Rejected")
 
 		reply.Success = false
 
-		if len(rf.log) <= args.PrevLogIndex {
-			// if log doesn't have such key,
-			// return the latest log's index + 1 (next position)
-			reply.ConflictingEntryTerm = -1
-			reply.FirstIndexForTerm = rf.lastLog().Index + 1
+		// has such key,but term doesn't match
+		reply.ConflictingEntryTerm = rf.log[args.PrevLogIndex].Term
+		reply.FirstIndexForTerm = args.PrevLogIndex
 
-		} else {
-			// has such key,but term doesn't match
-			reply.ConflictingEntryTerm = rf.log[args.PrevLogIndex].Term
-			reply.FirstIndexForTerm = args.PrevLogIndex
+		// find the first key of that term
+		for ; reply.FirstIndexForTerm >= 1 && rf.log[reply.FirstIndexForTerm-1].Term == reply.ConflictingEntryTerm; reply.FirstIndexForTerm-- {
 
-			// find the first key of that term
-			for ; reply.FirstIndexForTerm >= 1 && rf.log[reply.FirstIndexForTerm-1].Term == reply.ConflictingEntryTerm; reply.FirstIndexForTerm-- {
-
-			}
 		}
 
 		return
 	}
 
-	rf.dprint("%+v", args)
+	// rf.dprint("%+v", rf.log)
 
 	for i, log := range args.Entries {
 		// if rf.log doesn't contain log.Index, append the rest
 		// <= for the first log is 0
 		// if the latest rf.log has index 1, the len(rf.log) is 2, but log has index 2
-		if len(rf.log) <= log.Index {
+		if len(rf.log)+rf.snapshotLastIndex <= log.Index {
 			rf.log = append(rf.log, args.Entries[i:]...)
 			break
 		} else {
@@ -304,11 +445,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.persist()
 
-	rf.dprint("%+v", rf.log)
+	// rf.dprint("%+v", rf.log)
 
 	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = intMin(args.LeaderCommit, rf.lastLog().Index)
-		rf.applyUncommitedMessagesIfNeeded()
+		N := intMin(args.LeaderCommit, rf.lastLog().Index)
+		rf.commitMessages(N)
 	}
 
 	reply.Success = true
@@ -453,7 +594,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Create the log entry
 	log := Log{
-		Index:   len(rf.log),
+		Index:   rf.lastLog().Index + 1,
 		Term:    rf.currentTerm,
 		Command: command,
 	}
@@ -675,6 +816,10 @@ func (rf *Raft) broadcast(empty bool) {
 			continue
 		}
 
+		prevLog := rf.prevLogInfo(rf.nextIndex[i])
+
+		rf.dprint("%+v", prevLog)
+
 		args := AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
@@ -682,13 +827,13 @@ func (rf *Raft) broadcast(empty bool) {
 			LeaderCommit: rf.commitIndex,
 			// even there is no new entries,
 			// set prevLogIndex and prevLogTerm to check for consistency
-			PrevLogIndex: rf.log[rf.nextIndex[i]-1].Index,
-			PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
+			PrevLogIndex: prevLog.Index,
+			PrevLogTerm:  prevLog.Term,
 		}
 
 		if !empty && rf.lastLog().Index >= rf.nextIndex[i] {
 			rf.dprint("New entries to append for %d. %d >= %d", i, rf.lastLog().Index, rf.nextIndex[i])
-			args.Entries = rf.log[rf.nextIndex[i]:]
+			args.Entries = rf.log[rf.nextIndex[i]-rf.snapshotLastIndex:]
 		}
 
 		go func(i int) {
@@ -721,11 +866,12 @@ func (rf *Raft) broadcast(empty bool) {
 						rf.nextIndex[i] = args.Entries[len(args.Entries)-1].Index + 1
 						rf.matchIndex[i] = rf.nextIndex[i] - 1
 					}
-					N := len(rf.log) - 1
+
+					N := rf.lastLog().Index
 
 					for ; N >= rf.commitIndex+1; N-- {
 						// check if log[N].term == currentTerm
-						if rf.log[N].Term != rf.currentTerm {
+						if rf.log[N-rf.snapshotLastIndex].Term != rf.currentTerm {
 							continue
 						}
 
@@ -742,8 +888,7 @@ func (rf *Raft) broadcast(empty bool) {
 					}
 
 					if N >= rf.commitIndex+1 {
-						rf.commitIndex = N
-						rf.applyUncommitedMessagesIfNeeded()
+						rf.commitMessages(N)
 					}
 				} else {
 
@@ -797,7 +942,9 @@ func (rf *Raft) appendEntriesLoop() {
 }
 
 // requires lock
-func (rf *Raft) applyUncommitedMessagesIfNeeded() {
+func (rf *Raft) commitMessages(to int) {
+
+	rf.commitIndex = to
 
 	// if there are uncommitted messages,
 	// create a goroutine to commit them
@@ -808,7 +955,7 @@ func (rf *Raft) applyUncommitedMessagesIfNeeded() {
 
 		applyCh := rf.applyCh
 
-		for i, log := range rf.log[rf.lastApplied+1 : rf.commitIndex+1] {
+		for i, log := range rf.log[rf.lastApplied+1-rf.snapshotLastIndex : rf.commitIndex+1-rf.snapshotLastIndex] {
 			rf.dprint("Add command %+v to apply", log.Command)
 			messages = append(messages, ApplyMsg{
 				CommandValid: true,
