@@ -870,7 +870,7 @@ func (rf *Raft) runPreVote() bool {
 
 		// if role or term changes, ignore result
 		if rf.role != FOLLOWER || rf.currentTerm+1 != args.NextTerm {
-			rf.dprint("Role changed or term changed (%d+1 != %d). Failed", rf.currentTerm, args.NextTerm)
+			rf.dprint("Role changed (now %d) or term changed (%d+1 != %d). Failed", rf.role, rf.currentTerm, args.NextTerm)
 			rf.mu.Unlock()
 			return false
 		}
@@ -912,13 +912,16 @@ func (rf *Raft) electionLoop() {
 			rf.dprint("Election started.")
 		}
 
-		// Run PreVote
-		if !rf.runPreVote() {
-			rf.ldprint("PreVote failed. Restart election.")
-			continue
+		// For follower, run PreVote before becoming candidate
+		if rf.role == FOLLOWER {
+			if !rf.runPreVote() {
+				rf.ldprint("PreVote failed. Restart election.")
+				continue
+			} else {
+				// lock is released after runPreVote, relock
+				rf.mu.Lock()
+			}
 		}
-
-		rf.mu.Lock()
 
 		// Run actual request vote
 		rf.role = CANDIDATE
@@ -1004,7 +1007,7 @@ func (rf *Raft) electionLoop() {
 			result = r
 			rf.ldprint("Election completed")
 		case <-time.After(time.Until(timeout)):
-			rf.ldprint("Election timeout. Restart.")
+			rf.ldprint("Election timeout. Back to follower and restart.")
 		}
 
 		if result != nil {
@@ -1024,7 +1027,7 @@ func (rf *Raft) electionLoop() {
 					rf.dprint("Majority reached. Become leader.")
 					rf.toLeader()
 				} else {
-					rf.dprint("No majority reached. Restart election")
+					rf.dprint("No majority reached. Back to follower and restart election")
 				}
 			}
 			rf.mu.Unlock()
