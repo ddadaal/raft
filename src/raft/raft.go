@@ -708,8 +708,8 @@ func (rf *Raft) toLeader() {
 
 	rf.matchIndex = make([]int, len(rf.peers))
 
-	// insert a no-op log
-	rf.addCommand(-1)
+	// update the commitIndex
+	// rf.addCommand(-1)
 
 	// broadcast immediately
 	rf.broadcast()
