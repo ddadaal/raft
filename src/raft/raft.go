@@ -623,6 +623,24 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) addCommand(command interface{}) (int, int) {
+	log := Log{
+		Index:   rf.lastLog().Index + 1,
+		Term:    rf.currentTerm,
+		Command: command,
+	}
+
+	rf.log = append(rf.log, log)
+
+	rf.persist()
+
+	// update nextIndex for me
+	rf.nextIndex[rf.me] = log.Index + 1
+	rf.matchIndex[rf.me] = log.Index
+
+	return log.Index, log.Term
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -648,24 +666,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, -1, false
 	}
 
-	// Create the log entry
-	log := Log{
-		Index:   rf.lastLog().Index + 1,
-		Term:    rf.currentTerm,
-		Command: command,
-	}
+	index, term := rf.addCommand(command)
 
-	rf.log = append(rf.log, log)
+	rf.dprint("Created new log (%d, %d, %+v)", index, term, command)
 
-	rf.persist()
-
-	// update nextIndex for me
-	rf.nextIndex[rf.me] = log.Index + 1
-	rf.matchIndex[rf.me] = log.Index
-
-	rf.dprint("Created new log (%d, %d, %+v)", log.Index, log.Term, command)
-
-	return log.Index, log.Term, true
+	return index, term, true
 }
 
 //
@@ -702,11 +707,15 @@ func (rf *Raft) toLeader() {
 
 	rf.matchIndex = make([]int, len(rf.peers))
 
+	// insert a no-op log
+	rf.addCommand(-1)
+
 	// broadcast immediately
-	rf.broadcast(true)
+	rf.broadcast()
 }
 
 func (rf *Raft) toFollower(term int) {
+
 	rf.role = FOLLOWER
 
 	rf.currentTerm = term
@@ -722,7 +731,7 @@ func getElectionTimeout() time.Duration {
 }
 
 func (rf *Raft) dprint(format string, a ...interface{}) {
-	DPrintf("[%d] "+format, append([]interface{}{rf.me}, a...)...)
+	DPrintf("[%d, %d] "+format, append([]interface{}{rf.me, rf.currentTerm}, a...)...)
 }
 
 // locked version of dprint
@@ -866,18 +875,24 @@ func (rf *Raft) tryCommit() {
 	N := rf.lastLog().Index
 
 	for ; N >= rf.commitIndex+1; N-- {
+
+		log := rf.getLogAt(N)
+
+		rf.dprint("Log[%d].Term = %d, rf.commitIndex == %d", log.Index, log.Term, rf.commitIndex)
+
 		// check if log[N].term == currentTerm
-		if rf.getLogAt(N).Term != rf.currentTerm {
+		if log.Term != rf.currentTerm {
 			continue
 		}
 
-		// check if a majority of matchIndex[i] > N
+		// check if a majority of matchIndex[i] >= N
 		count := 0
 		for i := range rf.matchIndex {
 			if rf.matchIndex[i] >= N {
 				count++
 			}
 		}
+		rf.dprint("for N == %d, %d matchIndexes >= N", N, count)
 		if count > len(rf.matchIndex)/2 {
 			break
 		}
@@ -891,7 +906,7 @@ func (rf *Raft) tryCommit() {
 }
 
 // requires lock
-func (rf *Raft) broadcast(empty bool) {
+func (rf *Raft) broadcast() {
 
 	rf.lastBroadcastTime = time.Now()
 
@@ -944,7 +959,7 @@ func (rf *Raft) broadcast(empty bool) {
 			PrevLogTerm:  prevLog.Term,
 		}
 
-		if !empty && rf.lastLog().Index >= rf.nextIndex[i] {
+		if rf.lastLog().Index >= rf.nextIndex[i] {
 			rf.dprint("New entries to append for %d. %d >= %d", i, rf.lastLog().Index, rf.nextIndex[i])
 			args.Entries = rf.log[rf.nextIndex[i]-rf.snapshotLastIndex:]
 		}
@@ -970,6 +985,7 @@ func (rf *Raft) broadcast(empty bool) {
 
 				// if rf is not leader or term has changed, ignore
 				if rf.role != LEADER || rf.currentTerm != args.Term {
+					rf.dprint("Is not leader or term changes (%d != %d). Ignore future handling.", rf.currentTerm, args.Term)
 					rf.mu.Unlock()
 					return
 				}
@@ -980,7 +996,7 @@ func (rf *Raft) broadcast(empty bool) {
 						rf.nextIndex[i] = args.Entries[len(args.Entries)-1].Index + 1
 						rf.matchIndex[i] = rf.nextIndex[i] - 1
 						rf.dprint("nextIndex, matchIndex for %d: %d, %d", i, rf.nextIndex[i], rf.matchIndex[i])
-						
+
 						rf.tryCommit()
 
 					}
@@ -1027,7 +1043,7 @@ func (rf *Raft) appendEntriesLoop() {
 			continue
 		}
 
-		rf.broadcast(false)
+		rf.broadcast()
 
 		rf.mu.Unlock()
 
@@ -1050,12 +1066,16 @@ func (rf *Raft) commitMessages(to int) {
 		applyCh := rf.applyCh
 
 		for i, log := range rf.log[rf.lastApplied+1-rf.snapshotLastIndex : rf.commitIndex+1-rf.snapshotLastIndex] {
+			// if log.Command != nil {
 			rf.dprint("Apply index %d", log.Index)
 			messages = append(messages, ApplyMsg{
 				CommandValid: true,
 				Command:      log.Command,
 				CommandIndex: rf.lastApplied + 1 + i,
 			})
+			// } else {
+			// 	rf.dprint("Ignore no-op entry at index %d", log.Index)
+			// }
 		}
 		rf.lastApplied = rf.commitIndex
 
