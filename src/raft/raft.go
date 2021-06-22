@@ -198,10 +198,18 @@ func (rf *Raft) readPersist(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 
-	if d.Decode(&rf.currentTerm) != nil || d.Decode(&rf.votedFor) != nil || d.Decode(&rf.log) != nil || d.Decode(&rf.snapshotLastIndex) != nil || d.Decode(&rf.snapshotLastTerm) != nil {
+	var currentTerm, votedFor, snapshotLastIndex, snapshotLastTerm int
+	var log []Log
+
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil || d.Decode(&snapshotLastIndex) != nil || d.Decode(&snapshotLastTerm) != nil {
 		panic("Error during readPersist.")
 	}
 
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.snapshotLastIndex = snapshotLastIndex
+	rf.snapshotLastTerm = snapshotLastTerm
+	rf.log = log
 	rf.lastApplied = rf.snapshotLastIndex
 	rf.commitIndex = rf.snapshotLastIndex
 
@@ -854,6 +862,34 @@ func (rf *Raft) electionLoop() {
 
 }
 
+func (rf *Raft) tryCommit() {
+	N := rf.lastLog().Index
+
+	for ; N >= rf.commitIndex+1; N-- {
+		// check if log[N].term == currentTerm
+		if rf.getLogAt(N).Term != rf.currentTerm {
+			continue
+		}
+
+		// check if a majority of matchIndex[i] > N
+		count := 0
+		for i := range rf.matchIndex {
+			if rf.matchIndex[i] >= N {
+				count++
+			}
+		}
+		if count > len(rf.matchIndex)/2 {
+			break
+		}
+	}
+
+	rf.dprint("N == %d, rf.commitIndex == %d", N, rf.commitIndex)
+
+	if N >= rf.commitIndex+1 {
+		rf.commitMessages(N)
+	}
+}
+
 // requires lock
 func (rf *Raft) broadcast(empty bool) {
 
@@ -876,7 +912,7 @@ func (rf *Raft) broadcast(empty bool) {
 				LeaderId:          rf.me,
 				LastIncludedIndex: lastIncludedIndex,
 				LastIncludedTerm:  lastIncludedTerm,
-				Data:              rf.persister.snapshot,
+				Data:              rf.persister.ReadSnapshot(),
 			}
 			go func(i int) {
 				reply := InstallSnapshotReply{}
@@ -888,6 +924,7 @@ func (rf *Raft) broadcast(empty bool) {
 
 					rf.nextIndex[i] = lastIncludedIndex + 1
 					rf.matchIndex[i] = lastIncludedIndex
+					rf.tryCommit()
 					rf.mu.Unlock()
 				}
 			}(i)
@@ -942,30 +979,10 @@ func (rf *Raft) broadcast(empty bool) {
 					if len(args.Entries) > 0 {
 						rf.nextIndex[i] = args.Entries[len(args.Entries)-1].Index + 1
 						rf.matchIndex[i] = rf.nextIndex[i] - 1
+						rf.dprint("nextIndex, matchIndex for %d: %d, %d", i, rf.nextIndex[i], rf.matchIndex[i])
+						
+						rf.tryCommit()
 
-						N := rf.lastLog().Index
-
-						for ; N >= rf.commitIndex+1; N-- {
-							// check if log[N].term == currentTerm
-							if rf.getLogAt(N).Term != rf.currentTerm {
-								continue
-							}
-
-							// check if a majority of matchIndex[i] > N
-							count := 0
-							for i := range rf.matchIndex {
-								if rf.matchIndex[i] >= N {
-									count++
-								}
-							}
-							if count > len(rf.matchIndex)/2 {
-								break
-							}
-						}
-
-						if N >= rf.commitIndex+1 {
-							rf.commitMessages(N)
-						}
 					}
 				} else {
 
