@@ -403,7 +403,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.dprint("Handle AppendEntries from leader %d. Log size %d", args.LeaderId, len(args.Entries))
 
-	rf.resetLastHeard()
 	reply.Term = rf.currentTerm
 
 	if args.Term < rf.currentTerm {
@@ -413,6 +412,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.dprint("Incoming AppendEntries has lower term %d < %d. Rejected.", args.Term, rf.currentTerm)
 		return
 	}
+
+	rf.resetLastHeard()
 
 	// the incoming args have higher term
 	// change term, and become follower
