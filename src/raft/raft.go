@@ -518,6 +518,49 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+// requires lock
+func (rf *Raft) isUptoDate(lastLogIndex, lastLogTerm int) bool {
+	lastLog := rf.lastLog()
+	return (lastLogTerm > lastLog.Term) || (lastLogTerm == lastLog.Term && lastLogIndex >= lastLog.Index)
+}
+
+// PreVote RPC
+
+type PreVoteArgs struct {
+	NextTerm     int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+type PreVoteReply struct {
+	Term        int
+	VoteGranted bool
+}
+
+func (rf *Raft) PreVote(args *PreVoteArgs, reply *PreVoteReply) {
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+
+	if args.NextTerm < rf.currentTerm {
+		return
+	}
+
+	if rf.isUptoDate(args.LastLogIndex, args.LastLogTerm) {
+		reply.VoteGranted = true
+	}
+
+}
+
+func (rf *Raft) sendPreVote(server int, args *PreVoteArgs, reply *PreVoteReply) bool {
+	ok := rf.peers[server].Call("Raft.PreVote", args, reply)
+	return ok
+}
+
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -565,12 +608,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.toFollower(args.Term)
 	}
 
-	lastLog := rf.lastLog()
-
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		uptodate := (args.LastLogTerm > lastLog.Term) || (args.LastLogTerm == lastLog.Term && args.LastLogIndex >= lastLog.Index)
-
-		if uptodate {
+		if rf.isUptoDate(args.LastLogIndex, args.LastLogTerm) {
 			rf.dprint("Granted RequestVote from %d", args.CandidateId)
 			reply.VoteGranted = true
 
@@ -742,6 +781,119 @@ func (rf *Raft) ldprint(format string, a ...interface{}) {
 	rf.mu.Unlock()
 }
 
+func (rf *Raft) runPreVote() bool {
+	rf.dprint("Start prevote")
+
+	rf.resetLastHeard()
+
+	timeout := rf.electionTimeoutTime
+
+	voteResultChan := make(chan *PreVoteReply, len(rf.peers))
+
+	lastLog := rf.lastLog()
+
+	args := PreVoteArgs{
+		NextTerm:     rf.currentTerm + 1,
+		CandidateId:  rf.me,
+		LastLogIndex: lastLog.Index,
+		LastLogTerm:  lastLog.Term,
+	}
+
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(id int) {
+			reply := PreVoteReply{}
+			if ok := rf.sendPreVote(id, &args, &reply); ok {
+				voteResultChan <- &reply
+			} else {
+				voteResultChan <- nil
+			}
+		}(i)
+	}
+
+	rf.mu.Unlock()
+
+	type Result struct {
+		finishCount int
+		voteCount   int
+		maxTerm     int
+	}
+
+	resultChan := make(chan *Result, 1)
+
+	go func() {
+		finishCount := 1
+		voteCount := 1
+		maxTerm := 0
+
+		for voteResult := range voteResultChan {
+			finishCount += 1
+			if voteResult != nil {
+				if voteResult.VoteGranted {
+					voteCount += 1
+				}
+				// record max term
+				if voteResult.Term > maxTerm {
+					maxTerm = voteResult.Term
+				}
+			}
+			// if all send completes, or majority of votes has been received, end
+			if finishCount == len(rf.peers) || voteCount > len(rf.peers)/2 {
+				break
+			}
+		}
+
+		resultChan <- &Result{
+			finishCount: finishCount,
+			voteCount:   voteCount,
+			maxTerm:     maxTerm,
+		}
+	}()
+
+	var result *Result
+
+	select {
+	case r := <-resultChan:
+		result = r
+		rf.ldprint("PreVote completed")
+	case <-time.After(time.Until(timeout)):
+		rf.ldprint("PreVote timeout. Restart.")
+		return false
+	}
+
+	shouldContinue := false
+
+	if result != nil {
+		rf.mu.Lock()
+
+		// if role or term changes, ignore result
+		if rf.role != FOLLOWER || rf.currentTerm+1 != args.NextTerm {
+			rf.dprint("Role changed or term changed (%d+1 != %d). Failed", rf.currentTerm, args.NextTerm)
+			rf.mu.Unlock()
+			return false
+		}
+
+		// received higher term, this vote should be ignored
+		if result.maxTerm > rf.currentTerm {
+			rf.toFollower(result.maxTerm)
+		} else {
+			if result.voteCount > len(rf.peers)/2 {
+				rf.dprint("Majority reached. To actual RequestVote.")
+				shouldContinue = true
+			} else {
+				rf.dprint("No majority reached. Restart election")
+				rf.resetLastHeard()
+			}
+		}
+		rf.mu.Unlock()
+	}
+
+	return shouldContinue
+
+}
+
 func (rf *Raft) electionLoop() {
 	for !rf.killed() {
 
@@ -760,6 +912,15 @@ func (rf *Raft) electionLoop() {
 			rf.dprint("Election started.")
 		}
 
+		// Run PreVote
+		if !rf.runPreVote() {
+			rf.ldprint("PreVote failed. Restart election.")
+			continue
+		}
+
+		rf.mu.Lock()
+
+		// Run actual request vote
 		rf.role = CANDIDATE
 		rf.currentTerm++
 		rf.votedFor = rf.me
