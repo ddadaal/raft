@@ -36,6 +36,14 @@ const (
 	FOLLOWER  = 3
 )
 
+// feature flags
+
+const (
+	PREVOTE          = true
+	LEADER_STICKNESS = true
+	NOOP_LOG         = false
+)
+
 const HEARTBEAT_INTERVAL = 100
 
 const ELECTION_TIMEOUT_MIN = 250
@@ -417,7 +425,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.nextVoteTime = time.Now().Add(getElectionTimeout())
+	if LEADER_STICKNESS {
+		rf.nextVoteTime = time.Now().Add(getElectionTimeout())
+	}
 
 	rf.resetLastHeard()
 
@@ -553,7 +563,7 @@ func (rf *Raft) PreVote(args *PreVoteArgs, reply *PreVoteReply) {
 	reply.VoteGranted = false
 
 	// leader stickness
-	if time.Now().Before(rf.nextVoteTime) {
+	if LEADER_STICKNESS && time.Now().Before(rf.nextVoteTime) {
 		return
 	}
 
@@ -619,7 +629,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// leader stickness
-	if time.Now().Before(rf.nextVoteTime) {
+	if LEADER_STICKNESS && time.Now().Before(rf.nextVoteTime) {
 		return
 	}
 
@@ -768,7 +778,9 @@ func (rf *Raft) toLeader() {
 	rf.matchIndex = make([]int, len(rf.peers))
 
 	// update the commitIndex
-	// rf.addCommand(-1)
+	if NOOP_LOG {
+		rf.addCommand(-1)
+	}
 
 	// broadcast immediately
 	rf.broadcast()
@@ -933,7 +945,7 @@ func (rf *Raft) electionLoop() {
 		}
 
 		// // For follower, run PreVote before becoming candidate
-		if rf.role == FOLLOWER {
+		if PREVOTE && rf.role == FOLLOWER {
 			if !rf.runPreVote() {
 				rf.ldprint("PreVote failed. Restart election.")
 				continue
