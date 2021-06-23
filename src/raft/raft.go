@@ -105,6 +105,10 @@ type Raft struct {
 
 	lastBroadcastTime time.Time
 
+	// Reset at AppendEntries
+	// Can only vote or prevote after this time
+	nextVoteTime time.Time
+
 	applyCh chan ApplyMsg
 
 	// snapshots
@@ -413,6 +417,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	rf.nextVoteTime = time.Now().Add(getElectionTimeout())
+
 	rf.resetLastHeard()
 
 	// the incoming args have higher term
@@ -546,6 +552,11 @@ func (rf *Raft) PreVote(args *PreVoteArgs, reply *PreVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
+	// leader stickness
+	if time.Now().Before(rf.nextVoteTime) {
+		return
+	}
+
 	if args.NextTerm < rf.currentTerm {
 		return
 	}
@@ -604,6 +615,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if args.Term < rf.currentTerm {
 		rf.dprint("Rejected RequestVote from %d due to term", args.CandidateId)
+		return
+	}
+
+	// leader stickness
+	if time.Now().Before(rf.nextVoteTime) {
 		return
 	}
 
