@@ -39,7 +39,7 @@ const (
 // feature flags
 
 const (
-	PREVOTE          = false
+	PREVOTE          = true
 	LEADER_STICKNESS = false
 	NOOP_LOG         = false
 )
