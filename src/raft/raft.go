@@ -502,7 +502,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
-	// rf.dprint("%+v", rf.log)
+	rf.dprint("LeaderCommit %d, commitIndex %d", args.LeaderCommit, rf.commitIndex)
 
 	if args.LeaderCommit > rf.commitIndex {
 		N := intMin(args.LeaderCommit, rf.lastLog().Index)
@@ -549,6 +549,8 @@ func (rf *Raft) PreVote(args *PreVoteArgs, reply *PreVoteReply) {
 	if args.NextTerm < rf.currentTerm {
 		return
 	}
+
+
 
 	if rf.isUptoDate(args.LastLogIndex, args.LastLogTerm) {
 		reply.VoteGranted = true
@@ -912,7 +914,7 @@ func (rf *Raft) electionLoop() {
 			rf.dprint("Election started.")
 		}
 
-		// For follower, run PreVote before becoming candidate
+		// // For follower, run PreVote before becoming candidate
 		if rf.role == FOLLOWER {
 			if !rf.runPreVote() {
 				rf.ldprint("PreVote failed. Restart election.")
@@ -1113,6 +1115,8 @@ func (rf *Raft) broadcast() {
 
 		prevLog := rf.prevLogInfo(rf.nextIndex[i])
 
+		rf.dprint("leader commitIndex %d", rf.commitIndex)
+
 		args := AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
@@ -1220,6 +1224,7 @@ func (rf *Raft) appendEntriesLoop() {
 func (rf *Raft) commitMessages(to int) {
 
 	rf.commitIndex = to
+	rf.dprint("commitIndex to %d", to)
 
 	// if there are uncommitted messages,
 	// create a goroutine to commit them
