@@ -15,6 +15,9 @@ PKUEECS 研究生课程 分布式系统概念与设计 大作业：Raft算法实
 - Pre Vote ([Four modifications for the Raft consensus algorithm](https://www.openlife.cc/sites/default/files/4-modifications-for-Raft-consensus.pdf))
 - Leader Stickiness (来源同上)
 
+通过测试截图：
+
+![通过测试](test.png)
 
 # 优化
 
