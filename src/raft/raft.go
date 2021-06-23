@@ -39,8 +39,8 @@ const (
 // feature flags
 
 const (
-	PREVOTE          = true
-	LEADER_STICKNESS = true
+	PREVOTE          = false
+	LEADER_STICKNESS = false
 	NOOP_LOG         = false
 )
 
@@ -275,8 +275,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		rf.log = append([]Log{firstElement}, rf.log[i+1:]...)
 	}
 
-	rf.lastApplied = index
-	rf.commitIndex = index
+	// rf.lastApplied = index
+	// rf.commitIndex = index
 
 	rf.persist()
 	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
