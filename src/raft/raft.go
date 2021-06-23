@@ -550,7 +550,9 @@ func (rf *Raft) PreVote(args *PreVoteArgs, reply *PreVoteReply) {
 		return
 	}
 
-
+	if args.NextTerm > rf.currentTerm+1 {
+		rf.toFollower(args.NextTerm - 1)
+	}
 
 	if rf.isUptoDate(args.LastLogIndex, args.LastLogTerm) {
 		reply.VoteGranted = true
