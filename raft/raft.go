@@ -39,9 +39,9 @@ const (
 // feature flags
 
 const (
-	PREVOTE          = true
-	LEADER_STICKNESS = false
-	NOOP_LOG         = false
+	PREVOTE           = true
+	LEADER_STICKINESS = false
+	NOOP_LOG          = false
 )
 
 const HEARTBEAT_INTERVAL = 100
@@ -425,7 +425,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if LEADER_STICKNESS {
+	if LEADER_STICKINESS {
 		rf.nextVoteTime = time.Now().Add(getElectionTimeout())
 	}
 
@@ -562,8 +562,7 @@ func (rf *Raft) PreVote(args *PreVoteArgs, reply *PreVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
-	// leader stickness
-	if LEADER_STICKNESS && time.Now().Before(rf.nextVoteTime) {
+	if LEADER_STICKINESS && time.Now().Before(rf.nextVoteTime) {
 		return
 	}
 
@@ -628,8 +627,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	// leader stickness
-	if LEADER_STICKNESS && time.Now().Before(rf.nextVoteTime) {
+	if LEADER_STICKINESS && time.Now().Before(rf.nextVoteTime) {
 		return
 	}
 
