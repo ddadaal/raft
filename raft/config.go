@@ -591,5 +591,6 @@ func (cfg *config) LogSize() int {
 			logsize = n
 		}
 	}
+
 	return logsize
 }
