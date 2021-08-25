@@ -2,7 +2,7 @@ use std::cmp::min;
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::channel::mpsc::{unbounded, UnboundedSender};
 use futures::channel::oneshot::{self, channel};
@@ -133,8 +133,8 @@ impl Raft {
             voted_for: None,
             leader: None,
             commit_index: 0,
-            match_index: Vec::with_capacity(peers_len),
-            next_index: Vec::with_capacity(peers_len),
+            match_index: vec![0; peers_len],
+            next_index: vec![0; peers_len],
             log: vec![Log {
                 term: 0,
                 index: 0,
@@ -489,6 +489,8 @@ impl Node {
                 rf.log(&format!("Election started"));
             }
 
+            let timeout = rf.election_timeout_time;
+
             rf.role = RaftRole::Candidate;
             rf.current_term += 1;
             rf.voted_for = Some(rf.me);
@@ -511,9 +513,9 @@ impl Node {
             };
 
             let mut tasks = FuturesUnordered::new();
-            for (i, _) in rf.peers.iter().enumerate() {
+            for (i, client) in rf.peers.iter().enumerate() {
                 if i != rf.me {
-                    tasks.push(rf.send_request_vote(i, args.clone()));
+                    tasks.push(client.request_vote(&args.clone()));
                 }
             }
 
@@ -545,12 +547,12 @@ impl Node {
                 .fuse(),
             );
 
-            let timeout = rf.election_timeout_time;
-
             let original_term = rf.current_term;
 
             let mut timeout_delay =
                 Delay::new(SystemTime::now().duration_since(timeout).unwrap()).fuse();
+
+            drop(rf);
 
             select! {
                 (_finish_count, vote_count, max_term) = vote_handler => {
@@ -570,6 +572,7 @@ impl Node {
                     }
                 },
                 () = timeout_delay => {
+                    let rf = self.raft.lock().unwrap();
                     rf.log("Election timeout. Back to follower and restart.");
                 },
             }
