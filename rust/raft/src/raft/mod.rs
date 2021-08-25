@@ -896,7 +896,8 @@ impl RaftService for Node {
                 if existing.term == log.term {
                     // ignored
                 } else {
-                    rf.log.drain(..actual_index);
+                    // remove every item after actual_index
+                    let _: Vec<_> = rf.log.drain(actual_index..).collect();
                     rf.log.extend_from_slice(&args.entries[i..]);
                     rf.persist();
                     break;
@@ -905,7 +906,7 @@ impl RaftService for Node {
         }
 
         rf.log(&format!(
-            "Log sise {}, LeaderCommit {}, commitIndex {}",
+            "Log size {}, LeaderCommit {}, commitIndex {}",
             rf.log.len(),
             args.leader_commit,
             rf.commit_index
