@@ -21,12 +21,10 @@ pub mod errors;
 pub mod persister;
 #[cfg(test)]
 mod tests;
-mod threadpool;
 
 use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
-use crate::raft::threadpool::go;
 
 const HEARTBEAT_INTERVAL: u32 = 100;
 
@@ -336,11 +334,13 @@ impl Raft {
             let mut apply_ch = self.apply_ch.clone();
 
             // start a thread to send messages
-            go(async move {
-                apply_ch
-                    .send_all(&mut stream::iter(messages).map(|x| Ok(x)))
-                    .await
-                    .unwrap();
+            thread::spawn(move || {
+                block_on(async move {
+                    apply_ch
+                        .send_all(&mut stream::iter(messages).map(|x| Ok(x)))
+                        .await
+                        .unwrap();
+                });
             });
         }
     }
