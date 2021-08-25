@@ -532,7 +532,7 @@ impl Node {
                 continue;
             }
 
-            self.broadcast(rf).await;
+            self.broadcast(rf);
         }
     }
 
@@ -630,7 +630,7 @@ impl Node {
                     } else if vote_count > rf.peers.len() / 2 {
                         rf.log("Majority reached. Become leader");
                         rf.to_leader();
-                        self.broadcast(rf).await;
+                        self.broadcast(rf);
                     } else {
                         rf.log("No majority reached. Back to follower and restart election.");
                     }
@@ -643,10 +643,8 @@ impl Node {
         }
     }
 
-    async fn broadcast(&self, mut rf: std::sync::MutexGuard<'_, Raft>) {
+    fn broadcast(&self, mut rf: std::sync::MutexGuard<'_, Raft>) {
         rf.last_broadcast_time = SystemTime::now();
-
-        let mut tasks = FuturesUnordered::new();
 
         for (i, client) in rf.peers.iter().enumerate() {
             if i == rf.me {
@@ -672,7 +670,13 @@ impl Node {
                     data: rf.persister.snapshot(),
                 };
 
-                let _ = client.install_snapshot(&args).await;
+                let client = client.clone();
+
+                thread::spawn(move || {
+                    block_on(async {
+                        let _ = client.install_snapshot(&args).await;
+                    });
+                });
                 continue;
             }
 
@@ -707,55 +711,54 @@ impl Node {
 
             rf.log(&format!("Sending AppendEntries to {}", i));
 
-            tasks.push(async move {
-                let reply = client.append_entries(&args).await;
+            thread::spawn(move || {
+                block_on(async move {
+                    let reply = client.append_entries(&args).await;
 
-                if let Ok(reply) = reply {
-                    let mut rf = raft.lock().unwrap();
-                    if reply.term > rf.current_term {
-                        rf.log(&format!(
-                            "Received reply with higher term {} > {}. To Follower",
-                            reply.term, rf.current_term
-                        ));
-                        rf.to_follower(reply.term);
-                        return;
-                    }
-                    if rf.role != RaftRole::Leader || rf.current_term != args.term {
-                        rf.log(&format!(
-                            "Is not leader or term changes ({} != {}), Ignore.",
-                            rf.current_term, args.term,
-                        ));
-                        return;
-                    }
-
-                    if reply.success {
-                        rf.log(&format!("AppendEntries to {} successful", i));
-
-                        if args.entries.len() > 0 {
-                            rf.next_index[i] = (args.entries.last().unwrap().index + 1) as usize;
-                            rf.match_index[i] = rf.next_index[i] - 1;
+                    if let Ok(reply) = reply {
+                        let mut rf = raft.lock().unwrap();
+                        if reply.term > rf.current_term {
                             rf.log(&format!(
-                                "for {}, nextIndex == {}, matchIndex == {}",
-                                i, rf.next_index[i], rf.match_index[i]
+                                "Received reply with higher term {} > {}. To Follower",
+                                reply.term, rf.current_term
                             ));
-                            rf.try_commit();
+                            rf.to_follower(reply.term);
+                            return;
                         }
-                    } else {
-                        if reply.conflicting_entry_term != -1 {
-                            rf.next_index[i] = reply.first_index_for_term as usize;
+                        if rf.role != RaftRole::Leader || rf.current_term != args.term {
+                            rf.log(&format!(
+                                "Is not leader or term changes ({} != {}), Ignore.",
+                                rf.current_term, args.term,
+                            ));
+                            return;
+                        }
+
+                        if reply.success {
+                            rf.log(&format!("AppendEntries to {} successful", i));
+
+                            if args.entries.len() > 0 {
+                                rf.next_index[i] =
+                                    (args.entries.last().unwrap().index + 1) as usize;
+                                rf.match_index[i] = rf.next_index[i] - 1;
+                                rf.log(&format!(
+                                    "for {}, nextIndex == {}, matchIndex == {}",
+                                    i, rf.next_index[i], rf.match_index[i]
+                                ));
+                                rf.try_commit();
+                            }
                         } else {
-                            if reply.first_index_for_term != -1 {
+                            if reply.conflicting_entry_term != -1 {
                                 rf.next_index[i] = reply.first_index_for_term as usize;
+                            } else {
+                                if reply.first_index_for_term != -1 {
+                                    rf.next_index[i] = reply.first_index_for_term as usize;
+                                }
                             }
                         }
                     }
-                }
+                })
             });
         }
-
-        drop(rf);
-
-        while let Some(_) = tasks.next().await {}
     }
 }
 
