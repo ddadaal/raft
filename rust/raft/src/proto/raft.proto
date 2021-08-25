@@ -48,6 +48,12 @@ message InstallSnapshotArgs {
   bytes data = 5;
 }
 
-message InstallSnapshotReply {
-  uint64 term = 1;
+message InstallSnapshotReply { uint64 term = 1; }
+
+message PersistedState {
+  uint64 current_term = 1;
+  sint64 voted_for = 2;
+  repeated Log log = 3;
+  uint64 snapshot_last_index = 4;
+  uint64 snapshot_last_term = 5;
 }

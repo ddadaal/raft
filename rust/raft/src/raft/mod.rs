@@ -83,7 +83,7 @@ pub struct Raft {
     // state a Raft server must maintain.
     role: RaftRole,
     current_term: u64,
-    voted_for: Option<usize>,
+    voted_for: isize,
     log: Vec<Log>,
 
     commit_index: usize,
@@ -131,7 +131,7 @@ impl Raft {
             apply_ch,
             role: RaftRole::Follower,
             current_term: 0,
-            voted_for: None,
+            voted_for: -1,
             leader: None,
             commit_index: 0,
             match_index: vec![0; peers_len],
@@ -161,9 +161,19 @@ impl Raft {
     fn persist(&mut self) {
         // Your code here (2C).
         // Example:
-        // labcodec::encode(&self.xxx, &mut data).unwrap();
-        // labcodec::encode(&self.yyy, &mut data).unwrap();
-        // self.persister.save_raft_state(data);
+
+        let mut buf = Vec::new();
+
+        let state = PersistedState {
+            current_term: self.current_term,
+            voted_for: self.voted_for as i64,
+            log: self.log.clone(),
+            snapshot_last_index: self.snapshot_last_index as u64,
+            snapshot_last_term: self.snapshot_last_term,
+        };
+
+        labcodec::encode(&state, &mut buf).unwrap();
+        self.persister.save_raft_state(buf);
     }
 
     /// restore previously persisted state.
@@ -174,15 +184,19 @@ impl Raft {
         }
         // Your code here (2C).
         // Example:
-        // match labcodec::decode(data) {
-        //     Ok(o) => {
-        //         self.xxx = o.xxx;
-        //         self.yyy = o.yyy;
-        //     }
-        //     Err(e) => {
-        //         panic!("{:?}", e);
-        //     }
-        // }
+        match labcodec::decode::<PersistedState>(data) {
+            Ok(o) => {
+                self.current_term = o.current_term;
+                self.voted_for = o.voted_for as isize;
+                // first item is dummy
+                self.log.extend_from_slice(&o.log[1..]);
+                self.snapshot_last_index = o.snapshot_last_index as usize;
+                self.snapshot_last_term = o.snapshot_last_term;
+            }
+            Err(e) => {
+                panic!("{:?}", e);
+            }
+        }
     }
 
     /// example code to send a RequestVote RPC to a server.
@@ -275,7 +289,7 @@ impl Raft {
     fn to_follower(&mut self, term: Term) {
         self.role = RaftRole::Follower;
         self.current_term = term;
-        self.voted_for = None;
+        self.voted_for = -1;
         self.persist();
         self.leader = None;
     }
@@ -556,7 +570,7 @@ impl Node {
 
             rf.role = RaftRole::Candidate;
             rf.current_term += 1;
-            rf.voted_for = Some(rf.me);
+            rf.voted_for = rf.me as isize;
             rf.persist();
 
             rf.reset_last_heard();
@@ -794,13 +808,13 @@ impl RaftService for Node {
             rf.to_follower(args.term);
         }
 
-        if None == rf.voted_for || rf.voted_for == Some(args.candidate_id as usize) {
+        if rf.voted_for == -1 || rf.voted_for == args.candidate_id as isize {
             if rf.is_up_to_date(args.last_log_index as usize, args.last_log_term) {
                 rf.log(&format!("Granted RequestVote from {}", args.candidate_id));
 
                 reply.vote_granted = true;
 
-                rf.voted_for = Some(args.candidate_id as usize);
+                rf.voted_for = args.candidate_id as isize;
 
                 rf.persist();
 
