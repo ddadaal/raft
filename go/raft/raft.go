@@ -1324,4 +1324,5 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.appendEntriesLoop()
 
 	return rf
+
 }
