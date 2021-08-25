@@ -1,13 +1,14 @@
 use std::cmp::min;
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::channel::mpsc::{unbounded, UnboundedSender};
 use futures::channel::oneshot::{self, channel};
 use futures::executor::block_on;
 use futures::future::{join_all, Either};
+use futures::lock::MutexGuard;
 use futures::stream::FuturesUnordered;
 use futures::{join, select, stream, FutureExt, SinkExt, StreamExt, TryFutureExt};
 use futures_timer::Delay;
@@ -20,10 +21,12 @@ pub mod errors;
 pub mod persister;
 #[cfg(test)]
 mod tests;
+mod threadpool;
 
 use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
+use crate::raft::threadpool::go;
 
 const HEARTBEAT_INTERVAL: u32 = 100;
 
@@ -227,22 +230,44 @@ impl Raft {
             .map_err(Error::Rpc)
     }
 
-    fn start<M>(&self, command: &M) -> Result<(u64, u64)>
+    fn add_command<M>(&mut self, command: &M) -> Result<(usize, u64)>
     where
         M: labcodec::Message,
     {
-        let index = 0;
-        let term = 0;
-        let is_leader = true;
+        let index = self.last_log().index + 1;
+        let term = self.current_term;
         let mut buf = vec![];
         labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
-        // Your code here (2B).
 
-        if is_leader {
-            Ok((index, term))
-        } else {
-            Err(Error::NotLeader)
+        let log = Log {
+            command: buf,
+            term,
+            index: index as u64,
+        };
+
+        self.log.push(log);
+
+        self.persist();
+
+        self.next_index[self.me] = index + 1;
+        self.match_index[self.me] = index;
+
+        Ok((index, term))
+    }
+
+    fn start<M>(&mut self, command: &M) -> Result<(u64, u64)>
+    where
+        M: labcodec::Message,
+    {
+        if self.role != RaftRole::Leader {
+            return Err(Error::NotLeader);
         }
+
+        let (index, term) = self.add_command(command)?;
+
+        self.log(&format!("Created new log (index {}, term {})", index, term));
+
+        Ok((index as u64, term))
     }
 
     fn log(&self, info: &str) {
@@ -257,7 +282,7 @@ impl Raft {
         self.leader = None;
     }
 
-    async fn to_leader(&mut self) {
+    fn to_leader(&mut self) {
         self.role = RaftRole::Leader;
 
         let last_log_index = self.last_log().index + 1;
@@ -265,8 +290,6 @@ impl Raft {
             self.next_index[i] = last_log_index;
             self.match_index[i] = 0;
         }
-
-        self.broadcast().await;
     }
 
     fn last_log(&self) -> LastLogInfo {
@@ -313,46 +336,63 @@ impl Raft {
             let mut apply_ch = self.apply_ch.clone();
 
             // start a thread to send messages
-            thread::spawn(move || {
-                block_on(async {
-                    apply_ch
-                        .send_all(&mut stream::iter(messages).map(|x| Ok(x)))
-                        .await
-                        .unwrap();
-                });
+            go(async move {
+                apply_ch
+                    .send_all(&mut stream::iter(messages).map(|x| Ok(x)))
+                    .await
+                    .unwrap();
             });
         }
     }
 
-    async fn broadcast(&mut self) {
-        self.last_broadcast_time = SystemTime::now();
+    fn get_log_at(&self, index: usize) -> &Log {
+        let actual_index = index - self.snapshot_last_index;
+        &self.log[actual_index]
+    }
 
-        for (i, client) in self.peers.iter().enumerate() {
-            if i == self.me {
+    fn try_commit(&mut self) {
+        let mut n = self.last_log().index;
+
+        while n >= self.commit_index + 1 {
+            let log = self.get_log_at(n);
+
+            self.log(&format!(
+                "Log[{}].Term = {}, rf.commitIndex == {}",
+                log.index, log.term, self.commit_index
+            ));
+
+            if log.term != self.current_term {
+                n -= 1;
                 continue;
             }
 
-            if self.next_index[i] - 1 < self.snapshot_last_index {
-                self.log(&format!(
-                    "{} is too laggy {} < {}. InstallSnapshot",
-                    i,
-                    self.next_index[i] - 1,
-                    self.snapshot_last_index
-                ));
+            let count = self.match_index.iter().filter(|x| **x >= n).count();
 
-                let last_included_index = self.snapshot_last_index as u64;
-                let last_included_term = self.snapshot_last_term;
+            self.log(&format!("for N == {}, {} match indexes >= N", n, count));
 
-                let args = InstallSnapshotArgs {
-                    term: self.current_term as u64,
-                    leader_id: self.me as u64,
-                    last_included_index: last_included_index,
-                    last_included_term: last_included_term,
-                    data: self.persister.snapshot(),
-                };
-
-                client.install_snapshot(&args);
+            if count > self.match_index.len() / 2 {
+                break;
             }
+            n -= 1;
+        }
+
+        self.log(&format!(
+            "N == {}, rf.commitIndex == {}",
+            n, self.commit_index
+        ));
+
+        if n >= self.commit_index + 1 {
+            self.commit_message(n);
+        }
+    }
+
+    fn prev_log_info(&self, index_previous_of: usize) -> (usize, u64) {
+        let actual_index = index_previous_of - self.snapshot_last_index;
+        if actual_index == 1 {
+            (self.snapshot_last_index, self.snapshot_last_term)
+        } else {
+            let last_log = &self.log[actual_index - 1];
+            (last_log.index as usize, last_log.term)
         }
     }
 }
@@ -401,14 +441,15 @@ impl Node {
             raft: Arc::new(Mutex::new(raft)),
         };
 
-        let node_clone = node.clone();
+        let mut node_clone = node.clone();
 
         // start election loop
-        thread::spawn(move || {
-            block_on(async {
-                node_clone.election_loop().await;
-            });
-        });
+        thread::spawn(move || block_on(node_clone.election_loop()));
+
+        let mut node_clone = node.clone();
+
+        // start appendentries loop
+        thread::spawn(move || block_on(node_clone.append_entries_loop()));
 
         node
     }
@@ -432,7 +473,7 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.start(command)
-        crate::your_code_here(command)
+        self.raft.lock().unwrap().start(command)
     }
 
     /// The current term of this peer.
@@ -473,7 +514,29 @@ impl Node {
         // Your code here, if desired.
     }
 
-    async fn election_loop(&self) {
+    async fn append_entries_loop(&mut self) {
+        loop {
+            Delay::new(Duration::from_millis(10)).await;
+
+            let rf = self.raft.lock().unwrap();
+
+            if rf.role != RaftRole::Leader {
+                continue;
+            }
+
+            if SystemTime::now()
+                .duration_since(rf.last_broadcast_time)
+                .unwrap()
+                < Duration::from_millis(HEARTBEAT_INTERVAL.into())
+            {
+                continue;
+            }
+
+            self.broadcast(rf).await;
+        }
+    }
+
+    async fn election_loop(&mut self) {
         loop {
             Delay::new(Duration::from_millis(10)).await;
 
@@ -566,7 +629,8 @@ impl Node {
                         rf.to_follower(max_term);
                     } else if vote_count > rf.peers.len() / 2 {
                         rf.log("Majority reached. Become leader");
-                        rf.to_leader().await;
+                        rf.to_leader();
+                        self.broadcast(rf).await;
                     } else {
                         rf.log("No majority reached. Back to follower and restart election.");
                     }
@@ -577,6 +641,121 @@ impl Node {
                 },
             }
         }
+    }
+
+    async fn broadcast(&self, mut rf: std::sync::MutexGuard<'_, Raft>) {
+        rf.last_broadcast_time = SystemTime::now();
+
+        let mut tasks = FuturesUnordered::new();
+
+        for (i, client) in rf.peers.iter().enumerate() {
+            if i == rf.me {
+                continue;
+            }
+
+            if rf.next_index[i] - 1 < rf.snapshot_last_index {
+                rf.log(&format!(
+                    "{} is too laggy {} < {}. InstallSnapshot",
+                    i,
+                    rf.next_index[i] - 1,
+                    rf.snapshot_last_index
+                ));
+
+                let last_included_index = rf.snapshot_last_index as u64;
+                let last_included_term = rf.snapshot_last_term;
+
+                let args = InstallSnapshotArgs {
+                    term: rf.current_term as u64,
+                    leader_id: rf.me as u64,
+                    last_included_index: last_included_index,
+                    last_included_term: last_included_term,
+                    data: rf.persister.snapshot(),
+                };
+
+                let _ = client.install_snapshot(&args).await;
+                continue;
+            }
+
+            let (prev_log_index, prev_log_term) = rf.prev_log_info(rf.next_index[i]);
+
+            rf.log(&format!("leader commit index {}", rf.commit_index));
+
+            let mut args = AppendEntriesArgs {
+                term: rf.current_term,
+                leader_id: rf.me as u64,
+                entries: Vec::new(),
+                leader_commit: rf.commit_index as u64,
+                prev_log_index: prev_log_index as u64,
+                prev_log_term,
+            };
+
+            if rf.last_log().index >= rf.next_index[i] {
+                rf.log(&format!(
+                    "New entries to append for {}. {} >= {}",
+                    i,
+                    rf.last_log().index,
+                    rf.next_index[i]
+                ));
+
+                args.entries
+                    .extend_from_slice(&rf.log[rf.next_index[i] - rf.snapshot_last_index..]);
+            }
+
+            let raft = self.raft.clone();
+
+            let client = client.clone();
+
+            rf.log(&format!("Sending AppendEntries to {}", i));
+
+            tasks.push(async move {
+                let reply = client.append_entries(&args).await;
+
+                if let Ok(reply) = reply {
+                    let mut rf = raft.lock().unwrap();
+                    if reply.term > rf.current_term {
+                        rf.log(&format!(
+                            "Received reply with higher term {} > {}. To Follower",
+                            reply.term, rf.current_term
+                        ));
+                        rf.to_follower(reply.term);
+                        return;
+                    }
+                    if rf.role != RaftRole::Leader || rf.current_term != args.term {
+                        rf.log(&format!(
+                            "Is not leader or term changes ({} != {}), Ignore.",
+                            rf.current_term, args.term,
+                        ));
+                        return;
+                    }
+
+                    if reply.success {
+                        rf.log(&format!("AppendEntries to {} successful", i));
+
+                        if args.entries.len() > 0 {
+                            rf.next_index[i] = (args.entries.last().unwrap().index + 1) as usize;
+                            rf.match_index[i] = rf.next_index[i] - 1;
+                            rf.log(&format!(
+                                "for {}, nextIndex == {}, matchIndex == {}",
+                                i, rf.next_index[i], rf.match_index[i]
+                            ));
+                            rf.try_commit();
+                        }
+                    } else {
+                        if reply.conflicting_entry_term != -1 {
+                            rf.next_index[i] = reply.first_index_for_term as usize;
+                        } else {
+                            if reply.first_index_for_term != -1 {
+                                rf.next_index[i] = reply.first_index_for_term as usize;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        drop(rf);
+
+        while let Some(_) = tasks.next().await {}
     }
 }
 
@@ -623,6 +802,8 @@ impl RaftService for Node {
                 rf.persist();
 
                 rf.role = RaftRole::Follower;
+
+                rf.reset_last_heard();
             } else {
                 rf.log(&format!(
                     "Rejected RequestVote from {} due to not update",
@@ -639,7 +820,8 @@ impl RaftService for Node {
 
         rf.log(&format!(
             "Handling AppendEntries from leader {}. Log size {}",
-            args.leader_id, 0
+            args.leader_id,
+            args.entries.len(),
         ));
 
         let mut reply = AppendEntriesReply {
@@ -720,14 +902,18 @@ impl RaftService for Node {
         }
 
         rf.log(&format!(
-            "LeaderCommit {}, commitIndex {}",
-            args.leader_commit, rf.commit_index
+            "Log sise {}, LeaderCommit {}, commitIndex {}",
+            rf.log.len(),
+            args.leader_commit,
+            rf.commit_index
         ));
 
         if args.leader_commit > (rf.commit_index as u64) {
             let n = min(args.leader_commit as usize, rf.last_log().index);
             rf.commit_message(n);
         }
+
+        reply.success = true;
 
         Ok(reply)
     }
