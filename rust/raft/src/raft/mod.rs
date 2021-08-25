@@ -850,7 +850,7 @@ impl RaftService for Node {
 
         rf.leader = Some(args.leader_id);
 
-        if ((rf.log.len() + rf.snapshot_last_index) as u64) < args.prev_log_index {
+        if ((rf.log.len() + rf.snapshot_last_index) as u64) <= args.prev_log_index {
             rf.log("Doesn't have PrevLogIndex. Rejects");
             reply.conflicting_entry_term = -1;
             reply.first_index_for_term = (rf.last_log().index + 1) as i64;
