@@ -26,8 +26,8 @@ pub struct KvServer {
     latest_index: u64,
     apply_ch: Option<UnboundedReceiver<ApplyMsg>>,
 
-    put_listeners: HashMap<u64, Vec<futures::channel::mpsc::UnboundedSender<()>>>,
-    get_listeners: HashMap<u64, Vec<futures::channel::mpsc::UnboundedSender<String>>>,
+    put_listeners: HashMap<u64, Vec<futures::channel::oneshot::Sender<()>>>,
+    get_listeners: HashMap<u64, Vec<futures::channel::oneshot::Sender<String>>>,
 }
 
 impl KvServer {
@@ -62,7 +62,7 @@ impl KvServer {
         println!("{} {}", self.me, log);
     }
 
-    pub fn register_put(&mut self, index: u64, sender: UnboundedSender<()>) {
+    pub fn register_put(&mut self, index: u64, sender: oneshot::Sender<()>) {
         let registered = self.put_listeners.get_mut(&index);
         if let Some(v) = registered {
             v.push(sender);
@@ -71,7 +71,7 @@ impl KvServer {
         }
     }
 
-    pub fn register_get(&mut self, index: u64, sender: UnboundedSender<String>) {
+    pub fn register_get(&mut self, index: u64, sender: oneshot::Sender<String>) {
         let registered = self.get_listeners.get_mut(&index);
         if let Some(v) = registered {
             v.push(sender);
@@ -140,11 +140,12 @@ impl Node {
                                 .get(&get.key)
                                 .map_or_else(|| String::new(), |x| x.to_string());
 
-                            let listeners = server.get_listeners.get_mut(&message.command_index);
+                            let listeners = server.get_listeners.remove(&message.command_index);
                             if let Some(v) = listeners {
-                                join_all(v.iter_mut().map(|x| x.send(value.to_string()))).await;
+                                for x in v {
+                                    let _ = x.send(value.to_string());
+                                }
                             }
-                            server.put_listeners.remove(&message.command_index);
                         }
                         raft_request::Req::Put(arg) => {
                             if arg.op == Op::Put as i32 {
@@ -165,11 +166,13 @@ impl Node {
                             }
 
                             // call the listeners and remove the items
-                            let listeners = server.put_listeners.get_mut(&message.command_index);
+                            let listeners = server.put_listeners.remove(&message.command_index);
+
                             if let Some(v) = listeners {
-                                join_all(v.iter_mut().map(|x| x.send(()))).await;
+                                for x in v {
+                                    let _ = x.send(());
+                                }
                             }
-                            server.put_listeners.remove(&message.command_index);
                         }
                     }
                 }
@@ -213,8 +216,9 @@ impl KvService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn get(&self, arg: GetRequest) -> labrpc::Result<GetReply> {
         // Your code here.
-        let mut rx = {
+        let rx = {
             let mut server = self.server.lock().unwrap();
+            let (tx, rx) = oneshot::channel();
 
             let r = server.rf.start(&RaftRequest {
                 req: Some(raft_request::Req::Get(arg)),
@@ -231,14 +235,13 @@ impl KvService for Node {
             }
 
             let (index, term) = r.unwrap();
-            let (tx, rx) = unbounded();
 
             server.register_get(index, tx);
 
             rx
         };
 
-        let value = rx.next().await.unwrap();
+        let value = rx.await.unwrap();
 
         Ok(GetReply {
             wrong_leader: false,
@@ -249,7 +252,7 @@ impl KvService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn put_append(&self, arg: PutAppendRequest) -> labrpc::Result<PutAppendReply> {
         // Your code here.
-        let mut rx = {
+        let rx = {
             let mut server = self.server.lock().unwrap();
 
             // write the log
@@ -268,7 +271,7 @@ impl KvService for Node {
             }
 
             let (index, term) = r.unwrap();
-            let (tx, rx) = unbounded();
+            let (tx, rx) = oneshot::channel();
 
             server.register_put(index, tx);
 
@@ -276,7 +279,7 @@ impl KvService for Node {
         };
 
         // wait for the latest_index to reach the index
-        rx.next().await;
+        rx.await;
 
         Ok(PutAppendReply {
             err: "".into(),
