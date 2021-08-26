@@ -283,7 +283,7 @@ impl Raft {
     }
 
     fn log(&self, info: &str) {
-        println!("{} [{}] {}", self.me, self.current_term, info);
+        // println!("{} [{}] {}", self.me, self.current_term, info);
     }
 
     fn to_follower(&mut self, term: Term) {
@@ -350,10 +350,9 @@ impl Raft {
             // start a thread to send messages
             thread::spawn(move || {
                 block_on(async move {
-                    apply_ch
+                    let _ = apply_ch
                         .send_all(&mut stream::iter(messages).map(|x| Ok(x)))
-                        .await
-                        .unwrap();
+                        .await;
                 });
             });
         }
