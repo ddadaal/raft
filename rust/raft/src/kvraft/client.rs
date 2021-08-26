@@ -48,21 +48,18 @@ impl Clerk {
         FExecute: Fn(usize) -> RpcFuture<labrpc::Result<T>>,
         FRetry: Fn(&T) -> bool,
     {
-        let mut i = self.leader_index.get().unwrap_or(0);
+        let leader_index = self.leader_index.get().unwrap_or(0);
 
-        while i < self.servers.len() {
+        for i in (0..self.servers.len()).cycle().skip(leader_index) {
             thread::sleep(Duration::from_millis(20));
             self.log(&format!("Sending to server {}", i));
             if let Ok(reply) = block_on(f(i)) {
                 if retry(&reply) {
                     self.log(&format!("Server {} is not leader. Change", i));
-                    i += 1;
-                    if i == self.servers.len() {
-                        i = 0;
-                    }
                     continue;
                 } else {
                     self.log(&format!("Server {} is leader. Executed", i));
+                    self.leader_index.set(Some(i));
                     return reply;
                 }
             }
