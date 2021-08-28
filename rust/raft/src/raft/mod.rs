@@ -41,6 +41,7 @@ pub struct ApplyMsg {
     pub command_valid: bool,
     pub command: Vec<u8>,
     pub command_index: u64,
+    pub command_term: u64,
 }
 
 /// State of a raft peer.
@@ -340,6 +341,7 @@ impl Raft {
                     command: log.command.clone(),
                     command_valid: true,
                     command_index: (self.last_applied + 1 + i) as u64,
+                    command_term: log.term,
                 });
             }
 
@@ -643,6 +645,7 @@ impl Node {
                     } else if vote_count > rf.peers.len() / 2 {
                         rf.log("Majority reached. Become leader");
                         rf.to_leader();
+                        // rf.add_command(&-1).unwrap();
                         self.broadcast(rf);
                     } else {
                         rf.log("No majority reached. Back to follower and restart election.");

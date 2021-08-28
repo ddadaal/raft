@@ -1,14 +1,23 @@
 use std::{
     borrow::Borrow,
     cell::{Cell, RefCell},
-    fmt, thread,
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
+    thread,
     time::Duration,
 };
 
-use futures::{executor::block_on, Future};
+use futures::{executor::block_on, select, Future, FutureExt};
+use futures_timer::Delay;
 use labrpc::RpcFuture;
 
 use crate::proto::kvraftpb::*;
+
+static ID: AtomicU64 = AtomicU64::new(0);
+
+fn get_and_increment_id() -> u64 {
+    ID.fetch_add(1, Ordering::SeqCst)
+}
 
 enum Op {
     Put(String, String),
@@ -51,8 +60,14 @@ impl Clerk {
         let leader_index = self.leader_index.get().unwrap_or(0);
 
         for i in (0..self.servers.len()).cycle().skip(leader_index) {
-            thread::sleep(Duration::from_millis(20));
             self.log(&format!("Sending to server {}", i));
+            // let value = block_on(async move {
+            //     select! {
+            //         value = f(i).fuse() => Some(value),
+            //         () = Delay::new(Duration::from_millis(200)).fuse() => None,
+            //     }
+            // });
+            // let value =
             if let Ok(reply) = block_on(f(i)) {
                 if retry(&reply) {
                     self.log(&format!("Server {} is not leader. Change", i));
@@ -78,7 +93,10 @@ impl Clerk {
         // You will have to modify this function.
         // crate::your_code_here(key)
 
-        let args = GetRequest { key };
+        let args = GetRequest {
+            key,
+            id: get_and_increment_id(),
+        };
 
         self.log(&format!("Request: {:?}", args));
 
@@ -98,11 +116,13 @@ impl Clerk {
                 key,
                 value,
                 op: crate::proto::kvraftpb::Op::Append as i32,
+                id: get_and_increment_id(),
             },
             Op::Put(key, value) => PutAppendRequest {
                 key,
                 value,
                 op: crate::proto::kvraftpb::Op::Put as i32,
+                id: get_and_increment_id(),
             },
         };
 
