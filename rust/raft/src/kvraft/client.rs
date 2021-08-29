@@ -3,7 +3,7 @@ use std::{
     cell::{Cell, RefCell},
     fmt,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -31,7 +31,7 @@ pub struct Clerk {
     pub name: String,
     pub servers: Vec<KvClient>,
     // You will have to modify this struct.
-    leader_index: Arc<Mutex<Option<usize>>>,
+    leader_index: AtomicUsize,
 }
 
 impl fmt::Debug for Clerk {
@@ -46,7 +46,7 @@ impl Clerk {
         Clerk {
             name,
             servers,
-            leader_index: Arc::new(Mutex::new(None)),
+            leader_index: AtomicUsize::new(0),
         }
         // crate::your_code_here((name, servers))
     }
@@ -60,7 +60,7 @@ impl Clerk {
         FExecute: Fn(usize) -> RpcFuture<labrpc::Result<T>> + Send,
         FRetry: Fn(&T) -> bool,
     {
-        let leader_index = { self.leader_index.lock().unwrap().unwrap_or(0) };
+        let leader_index = self.leader_index.load(Ordering::SeqCst);
 
         for i in (0..self.servers.len()).cycle().skip(leader_index) {
             self.log(&format!("Sending to server {}", i));
@@ -78,9 +78,7 @@ impl Clerk {
                         continue;
                     } else {
                         self.log(&format!("Server {} is leader. Executed", i));
-                        {
-                            *self.leader_index.lock().unwrap() = Some(i);
-                        }
+                        self.leader_index.store(i, Ordering::SeqCst);
                         return reply;
                     }
                 } else {

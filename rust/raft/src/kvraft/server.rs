@@ -89,6 +89,38 @@ impl KvServer {
         self.listeners.insert(index, (request_id, sender));
         receiver
     }
+
+    fn execute_request(&mut self, arg: RaftRequest) -> String {
+        match arg.req.unwrap() {
+            raft_request::Req::Get(get) => {
+                // call the listeners and remove the items
+                let value = self
+                    .hashmap
+                    .get(&get.key)
+                    .map_or_else(|| String::new(), |x| x.to_string());
+                value
+            }
+            raft_request::Req::Put(arg) => {
+                if arg.op == Op::Put as i32 {
+                    self.hashmap.insert(arg.key, arg.value.to_string());
+                    arg.value
+                } else {
+                    let value = self.hashmap.get(&arg.key);
+                    match value {
+                        Some(v) => {
+                            let new_value = format!("{}{}", v, arg.value);
+                            self.hashmap.insert(arg.key, new_value.to_string());
+                            new_value
+                        }
+                        None => {
+                            self.hashmap.insert(arg.key, arg.value.to_string());
+                            arg.value
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl KvServer {
@@ -121,38 +153,6 @@ pub struct Node {
 }
 
 impl Node {
-    fn execute_request(server: &mut std::sync::MutexGuard<KvServer>, arg: RaftRequest) -> String {
-        match arg.req.unwrap() {
-            raft_request::Req::Get(get) => {
-                // call the listeners and remove the items
-                let value = server
-                    .hashmap
-                    .get(&get.key)
-                    .map_or_else(|| String::new(), |x| x.to_string());
-                value
-            }
-            raft_request::Req::Put(arg) => {
-                if arg.op == Op::Put as i32 {
-                    server.hashmap.insert(arg.key, arg.value.to_string());
-                    arg.value
-                } else {
-                    let value = server.hashmap.get(&arg.key);
-                    match value {
-                        Some(v) => {
-                            let new_value = format!("{}{}", v, arg.value);
-                            server.hashmap.insert(arg.key, new_value.to_string());
-                            new_value
-                        }
-                        None => {
-                            server.hashmap.insert(arg.key, arg.value.to_string());
-                            arg.value
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     pub fn new(mut kv: KvServer) -> Node {
         // Your code here.
         // crate::your_code_here(kv);
@@ -179,7 +179,7 @@ impl Node {
                     }
 
                     let arg_id = arg.id;
-                    let value = Node::execute_request(&mut server, arg);
+                    let value = server.execute_request(arg);
 
                     if let Some((id, sender)) = server.listeners.remove(&message.command_index) {
                         if id != arg_id {
