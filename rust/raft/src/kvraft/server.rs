@@ -11,7 +11,7 @@ use futures::channel::oneshot;
 use futures::executor::block_on;
 use futures::future::join_all;
 use futures::lock::MutexGuard;
-use futures::{join, select, FutureExt, SinkExt, StreamExt};
+use futures::{join, select, Future, FutureExt, SinkExt, StreamExt};
 use futures_timer::Delay;
 
 use crate::proto::kvraftpb::*;
@@ -174,17 +174,26 @@ impl Node {
 
                     let arg = labcodec::decode::<RaftRequest>(&message.command).unwrap();
 
+                    if let Some(_) = server.executed_but_not_responded_ids.remove(&arg.id) {
+                        continue;
+                    }
+
+                    let arg_id = arg.id;
+                    let value = Node::execute_request(&mut server, arg);
+
                     if let Some((id, sender)) = server.listeners.remove(&message.command_index) {
-                        if id != arg.id {
+                        if id != arg_id {
                             sender.send(ListenResult::LeaderChange);
                             continue;
                         }
 
-                        let value = Node::execute_request(&mut server, arg);
-                        let _ = sender.send(ListenResult::Completed(value));
+                        if sender
+                            .send(ListenResult::Completed(value.to_string()))
+                            .is_err()
+                        {
+                            server.executed_but_not_responded_ids.insert(arg_id, value);
+                        }
                     } else {
-                        let arg_id = arg.id;
-                        let value = Node::execute_request(&mut server, arg);
                         server.executed_but_not_responded_ids.insert(arg_id, value);
                     }
                 }
@@ -254,6 +263,10 @@ impl KvService for Node {
         };
 
         let result = rx.await.unwrap();
+        // let result = select! {
+        //     value = rx => value.unwrap(),
+        //     () = Delay::new(Duration::from_millis(500)).fuse() => ListenResult::LeaderChange,
+        // };
 
         Ok(match result {
             ListenResult::Completed(value) => GetReply {
@@ -292,6 +305,10 @@ impl KvService for Node {
         };
 
         let result = rx.await.unwrap();
+        // let result = select! {
+        //     value = rx => value.unwrap(),
+        //     () = Delay::new(Duration::from_millis(500)).fuse() => ListenResult::LeaderChange,
+        // };
 
         Ok(match result {
             ListenResult::Completed(value) => PutAppendReply {

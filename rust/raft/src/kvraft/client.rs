@@ -2,7 +2,10 @@ use std::{
     borrow::Borrow,
     cell::{Cell, RefCell},
     fmt,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::Duration,
 };
@@ -28,7 +31,7 @@ pub struct Clerk {
     pub name: String,
     pub servers: Vec<KvClient>,
     // You will have to modify this struct.
-    leader_index: Cell<Option<usize>>,
+    leader_index: Arc<Mutex<Option<usize>>>,
 }
 
 impl fmt::Debug for Clerk {
@@ -43,7 +46,7 @@ impl Clerk {
         Clerk {
             name,
             servers,
-            leader_index: Cell::new(None),
+            leader_index: Arc::new(Mutex::new(None)),
         }
         // crate::your_code_here((name, servers))
     }
@@ -54,28 +57,35 @@ impl Clerk {
 
     fn execute<FExecute, FRetry, T>(&self, f: FExecute, retry: FRetry) -> T
     where
-        FExecute: Fn(usize) -> RpcFuture<labrpc::Result<T>>,
+        FExecute: Fn(usize) -> RpcFuture<labrpc::Result<T>> + Send,
         FRetry: Fn(&T) -> bool,
     {
-        let leader_index = self.leader_index.get().unwrap_or(0);
+        let leader_index = { self.leader_index.lock().unwrap().unwrap_or(0) };
 
         for i in (0..self.servers.len()).cycle().skip(leader_index) {
             self.log(&format!("Sending to server {}", i));
-            // let value = block_on(async move {
-            //     select! {
-            //         value = f(i).fuse() => Some(value),
-            //         () = Delay::new(Duration::from_millis(200)).fuse() => None,
-            //     }
-            // });
+            let value = block_on(async {
+                select! {
+                    value = f(i).fuse() => Some(value),
+                    () = Delay::new(Duration::from_millis(200)).fuse() => None,
+                }
+            });
             // let value =
-            if let Ok(reply) = block_on(f(i)) {
-                if retry(&reply) {
-                    self.log(&format!("Server {} is not leader. Change", i));
-                    continue;
+            if let Some(reply) = value {
+                if let Ok(reply) = reply {
+                    if retry(&reply) {
+                        self.log(&format!("Server {} is not leader. Change", i));
+                        continue;
+                    } else {
+                        self.log(&format!("Server {} is leader. Executed", i));
+                        {
+                            *self.leader_index.lock().unwrap() = Some(i);
+                        }
+                        return reply;
+                    }
                 } else {
-                    self.log(&format!("Server {} is leader. Executed", i));
-                    self.leader_index.set(Some(i));
-                    return reply;
+                    self.log(&format!("Server {} timeout", i));
+                    continue;
                 }
             }
         }
