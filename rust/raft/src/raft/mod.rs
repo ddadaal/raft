@@ -1,4 +1,5 @@
 use std::cmp::min;
+use std::mem::size_of_val;
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread::{self};
@@ -13,6 +14,7 @@ use futures::stream::FuturesUnordered;
 use futures::{join, select, stream, FutureExt, SinkExt, StreamExt, TryFutureExt};
 use futures_timer::Delay;
 use labcodec::Message;
+use prost::bytes::Bytes;
 use rand::Rng;
 
 #[cfg(test)]
@@ -193,6 +195,8 @@ impl Raft {
                 self.log.extend_from_slice(&o.log[1..]);
                 self.snapshot_last_index = o.snapshot_last_index as usize;
                 self.snapshot_last_term = o.snapshot_last_term;
+                self.last_applied = o.snapshot_last_index as usize;
+                self.commit_index = o.snapshot_last_index as usize;
             }
             Err(e) => {
                 panic!("{:?}", e);
@@ -527,6 +531,46 @@ impl Node {
     /// threads you generated with this Raft Node.
     pub fn kill(&self) {
         // Your code here, if desired.
+    }
+
+    /// Log size in bytes
+    pub fn log_size(&self) -> usize {
+        let rf = self.raft.lock().unwrap();
+
+        // https://stackoverflow.com/questions/62613488/how-do-i-get-the-runtime-memory-size-of-an-object
+        size_of_val(&*rf.log)
+    }
+
+    pub fn snapshot_to_latest(&self) {
+        let mut rf = self.raft.lock().unwrap();
+
+        if rf.log.len() == 1 {
+            rf.log(&format!("No log exists. Don't snapshot."));
+            return;
+        }
+
+        rf.log(&format!(
+            "Handling snapshot to commited log. Removing all logs."
+        ));
+
+        let actual_index = rf
+            .log
+            .iter()
+            .rev()
+            .position(|x| x.index == rf.commit_index as u64)
+            .unwrap();
+
+        rf.snapshot_last_index = rf.log[actual_index].index as usize;
+        rf.snapshot_last_term = rf.log[actual_index].term;
+
+        let removed_logs = rf.log.drain(1..actual_index + 1).collect::<Vec<_>>();
+
+        let mut buf = Vec::new();
+        labcodec::encode(&Snapshot { log: removed_logs }, &mut buf).unwrap();
+
+        rf.persist();
+        rf.persister
+            .save_state_and_snapshot(rf.persister.raft_state(), buf);
     }
 
     async fn append_entries_loop(&mut self) {
@@ -940,8 +984,87 @@ impl RaftService for Node {
 
     async fn install_snapshot(
         &self,
-        req: InstallSnapshotArgs,
+        args: InstallSnapshotArgs,
     ) -> labrpc::Result<InstallSnapshotReply> {
-        todo!()
+        let mut rf = self.raft.lock().unwrap();
+
+        rf.log(&format!("Handling InstallSnapshot"));
+
+        let reply = InstallSnapshotReply {
+            term: rf.current_term,
+        };
+
+        if args.term < rf.current_term {
+            rf.reset_last_heard();
+            return Ok(reply);
+        }
+
+        if args.term > rf.current_term {
+            rf.to_follower(args.term);
+        }
+
+        if args.last_included_index < (rf.snapshot_last_index as u64) {
+            rf.log(&format!(
+                "Received a outdated snapshot. Last index {} < {}",
+                args.last_included_index, rf.snapshot_last_index
+            ));
+        }
+
+        // find the index from the back
+        let mut index = 0;
+
+        for i in rf.log.len() - 1..0 {
+            if rf.log[i].index == args.last_included_index {
+                index = i;
+                break;
+            }
+        }
+
+        if index <= 0 {
+            if (rf.snapshot_last_index as u64) == args.last_included_index {
+                if rf.snapshot_last_term == args.last_included_term {
+                    rf.log(&format!(
+                        "The snapshot to {} is already token",
+                        rf.snapshot_last_index
+                    ));
+                } else {
+                    rf.log(&format!("Snapshot index matches, but term doesn't match."));
+                    unreachable!()
+                }
+            } else {
+                rf.log(&format!(
+                    "The snapshot to {} is not found. Removing all logs.",
+                    rf.snapshot_last_index
+                ));
+
+                rf.snapshot_last_index = args.last_included_index as usize;
+                rf.snapshot_last_term = args.last_included_term;
+                rf.log.drain(1..);
+            }
+        } else {
+            rf.log(&format!(
+                "Removing logs until index {}",
+                args.last_included_index
+            ));
+            rf.snapshot_last_index = rf.log[index].index as usize;
+            rf.snapshot_last_term = rf.log[index].term;
+            rf.log.drain(1..index + 1);
+        }
+
+        rf.last_applied = args.last_included_index as usize;
+        rf.commit_index = args.last_included_index as usize;
+
+        rf.log(&format!(
+            "Snapshot installed to {}",
+            args.last_included_index
+        ));
+
+        rf.persist();
+        rf.persister
+            .save_state_and_snapshot(rf.persister.raft_state(), args.data);
+
+        rf.reset_last_heard();
+
+        Ok(reply)
     }
 }

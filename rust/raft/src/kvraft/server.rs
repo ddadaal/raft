@@ -149,6 +149,7 @@ impl Node {
         // crate::your_code_here(kv);
 
         let mut apply_ch = kv.apply_ch.take().unwrap();
+        let max_state_size = kv.maxraftstate.take();
 
         let server = Arc::new(Mutex::new(kv));
 
@@ -160,6 +161,14 @@ impl Node {
                     let mut server = server_clone.lock().unwrap();
 
                     server.log(&format!("Received commit index {}", message.command_index));
+
+                    if let Some(max_state_size) = max_state_size {
+                        if server.rf.log_size() > max_state_size {
+                            server.log(&format!("Should snapshot."));
+
+                            server.rf.snapshot_to_latest();
+                        }
+                    }
 
                     server.latest_index = message.command_index;
 

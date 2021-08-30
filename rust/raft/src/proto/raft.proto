@@ -57,3 +57,5 @@ message PersistedState {
   uint64 snapshot_last_index = 4;
   uint64 snapshot_last_term = 5;
 }
+
+message Snapshot { repeated Log log = 1; }
