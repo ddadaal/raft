@@ -2,38 +2,21 @@ syntax = "proto3";
 
 package kvraftpb;
 
-enum Op {
-  Put = 0;
-  Append = 1;
+enum OpType {
+  Get = 0;
+  Put = 1;
+  Append = 2;
 }
 
-/// Put or Append
-message PutAppendRequest {
-  uint64 id = 1;
+message Request {
+  OpType op = 1;
   string key = 2;
   string value = 3;
-  // "Put" or "Append"
-  Op op = 4;
-  // You'll have to add definitions here.
+  string client_name = 4;
+  uint64 id = 5;
 }
 
-message PutAppendReply { bool wrong_leader = 1; }
-
-message GetRequest {
-  uint64 id = 1;
-  string key = 2;
-  // You'll have to add definitions here.
-}
-
-message GetReply {
+message Reply {
   bool wrong_leader = 1;
-  string value = 3;
-}
-
-message RaftRequest {
-  uint64 id = 1;
-  oneof req {
-    GetRequest get = 2;
-    PutAppendRequest put = 3;
-  }
+  string value = 2;
 }

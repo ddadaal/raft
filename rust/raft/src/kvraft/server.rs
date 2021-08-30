@@ -18,8 +18,9 @@ use crate::proto::kvraftpb::*;
 use crate::raft::errors::Error;
 use crate::raft::{self, ApplyMsg};
 
-pub enum ListenResult<T> {
-    Completed(T),
+#[derive(Debug)]
+pub enum ListenResult {
+    Completed(String),
     LeaderChange,
 }
 
@@ -33,11 +34,14 @@ pub struct KvServer {
     latest_index: u64,
     apply_ch: Option<UnboundedReceiver<ApplyMsg>>,
 
-    // key is id, value is result
-    executed_but_not_responded_ids: HashMap<u64, String>,
+    // every highest committed id for each client
+    highest_committed_id: HashMap<String, u64>,
+
+    // key is index, value is (id, result)
+    executed_results: HashMap<u64, (u64, String)>,
 
     // key is index, value is (id, sender)
-    listeners: HashMap<u64, (u64, oneshot::Sender<ListenResult<String>>)>,
+    results: HashMap<u64, (u64, oneshot::Sender<ListenResult>)>,
 }
 
 impl KvServer {
@@ -61,8 +65,9 @@ impl KvServer {
             hashmap: HashMap::new(),
             latest_index: 0,
             apply_ch: Some(apply_ch),
-            executed_but_not_responded_ids: HashMap::new(),
-            listeners: HashMap::new(),
+            highest_committed_id: HashMap::new(),
+            executed_results: HashMap::new(),
+            results: HashMap::new(),
         };
 
         server
@@ -72,50 +77,47 @@ impl KvServer {
         println!("{} {}", self.me, log);
     }
 
-    pub fn register(
-        &mut self,
-        request_id: u64,
-        index: u64,
-    ) -> oneshot::Receiver<ListenResult<String>> {
+    pub fn register(&mut self, request_id: u64, index: u64) -> oneshot::Receiver<ListenResult> {
         let (sender, receiver) = oneshot::channel();
-        // check if the index has already been executed
-        let result = self.executed_but_not_responded_ids.remove(&request_id);
 
-        if let Some(result) = result {
-            sender.send(ListenResult::Completed(result));
-            return receiver;
+        if let Some((id, result)) = self.executed_results.get(&index) {
+            if *id == request_id {
+                let (id, result) = self.executed_results.remove(&index).unwrap();
+                sender.send(ListenResult::Completed(result)).unwrap();
+            }
+        } else {
+            self.results.insert(index, (request_id, sender));
         }
 
-        self.listeners.insert(index, (request_id, sender));
         receiver
     }
 
-    fn execute_request(&mut self, arg: RaftRequest) -> String {
-        match arg.req.unwrap() {
-            raft_request::Req::Get(get) => {
+    fn apply_request(&mut self, arg: Request) -> String {
+        match arg.op() {
+            OpType::Get => {
                 // call the listeners and remove the items
                 let value = self
                     .hashmap
-                    .get(&get.key)
+                    .get(&arg.key)
                     .map_or_else(|| String::new(), |x| x.to_string());
+
                 value
             }
-            raft_request::Req::Put(arg) => {
-                if arg.op == Op::Put as i32 {
-                    self.hashmap.insert(arg.key, arg.value.to_string());
-                    arg.value
-                } else {
-                    let value = self.hashmap.get(&arg.key);
-                    match value {
-                        Some(v) => {
-                            let new_value = format!("{}{}", v, arg.value);
-                            self.hashmap.insert(arg.key, new_value.to_string());
-                            new_value
-                        }
-                        None => {
-                            self.hashmap.insert(arg.key, arg.value.to_string());
-                            arg.value
-                        }
+            OpType::Put => {
+                self.hashmap.insert(arg.key, arg.value.to_string());
+                arg.value
+            }
+            OpType::Append => {
+                let value = self.hashmap.get(&arg.key);
+                match value {
+                    Some(v) => {
+                        let new_value = format!("{}{}", v, arg.value);
+                        self.hashmap.insert(arg.key, new_value.to_string());
+                        new_value
+                    }
+                    None => {
+                        self.hashmap.insert(arg.key, arg.value.to_string());
+                        arg.value
                     }
                 }
             }
@@ -172,29 +174,33 @@ impl Node {
 
                     server.latest_index = message.command_index;
 
-                    let arg = labcodec::decode::<RaftRequest>(&message.command).unwrap();
+                    let arg = labcodec::decode::<Request>(&message.command).unwrap();
 
-                    if let Some(_) = server.executed_but_not_responded_ids.remove(&arg.id) {
-                        continue;
+                    // duplicate entry
+                    if let Some(highest_id) = server.highest_committed_id.get(&arg.client_name) {
+                        if arg.id <= *highest_id {
+                            continue;
+                        }
                     }
 
                     let arg_id = arg.id;
-                    let value = server.execute_request(arg);
 
-                    if let Some((id, sender)) = server.listeners.remove(&message.command_index) {
+                    if let Some((id, sender)) = server.results.remove(&message.command_index) {
                         if id != arg_id {
                             sender.send(ListenResult::LeaderChange);
                             continue;
                         }
+                        server
+                            .highest_committed_id
+                            .insert(arg.client_name.to_string(), id);
+                        let value = server.apply_request(arg);
 
-                        if sender
-                            .send(ListenResult::Completed(value.to_string()))
-                            .is_err()
-                        {
-                            server.executed_but_not_responded_ids.insert(arg_id, value);
-                        }
+                        sender.send(ListenResult::Completed(value.to_string()));
                     } else {
-                        server.executed_but_not_responded_ids.insert(arg_id, value);
+                        let value = server.apply_request(arg);
+                        server
+                            .executed_results
+                            .insert(message.command_index, (arg_id, value));
                     }
                 }
             });
@@ -235,21 +241,18 @@ impl Node {
 #[async_trait::async_trait]
 impl KvService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
-    async fn get(&self, arg: GetRequest) -> labrpc::Result<GetReply> {
+    async fn request_op(&self, req: Request) -> labrpc::Result<Reply> {
         // Your code here.
         let mut rx = {
             let mut server = self.server.lock().unwrap();
 
-            let id = arg.id;
+            let id = req.id;
 
-            let r = server.rf.start(&RaftRequest {
-                req: Some(raft_request::Req::Get(arg)),
-                id,
-            });
+            let r = server.rf.start(&req);
 
             if let Err(e) = r {
                 return match e {
-                    Error::NotLeader => Ok(GetReply {
+                    Error::NotLeader => Ok(Reply {
                         wrong_leader: true,
                         value: "".into(),
                     }),
@@ -269,52 +272,14 @@ impl KvService for Node {
         // };
 
         Ok(match result {
-            ListenResult::Completed(value) => GetReply {
+            ListenResult::Completed(value) => Reply {
                 wrong_leader: false,
                 value,
             },
-            ListenResult::LeaderChange => GetReply {
+            ListenResult::LeaderChange => Reply {
                 wrong_leader: true,
                 value: "".into(),
             },
-        })
-    }
-
-    // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
-    async fn put_append(&self, arg: PutAppendRequest) -> labrpc::Result<PutAppendReply> {
-        // Your code here.
-        let mut rx = {
-            let mut server = self.server.lock().unwrap();
-
-            let id = arg.id;
-            // write the log
-            let r = server.rf.start(&RaftRequest {
-                req: Some(raft_request::Req::Put(arg)),
-                id,
-            });
-
-            if let Err(e) = r {
-                return match e {
-                    Error::NotLeader => Ok(PutAppendReply { wrong_leader: true }),
-                    _ => Err(labrpc::Error::Other("".into())),
-                };
-            }
-
-            let (index, term) = r.unwrap();
-            server.register(id, index)
-        };
-
-        let result = rx.await.unwrap();
-        // let result = select! {
-        //     value = rx => value.unwrap(),
-        //     () = Delay::new(Duration::from_millis(500)).fuse() => ListenResult::LeaderChange,
-        // };
-
-        Ok(match result {
-            ListenResult::Completed(value) => PutAppendReply {
-                wrong_leader: false,
-            },
-            ListenResult::LeaderChange => PutAppendReply { wrong_leader: true },
         })
     }
 }

@@ -60,14 +60,14 @@ impl Clerk {
         FExecute: Fn(usize) -> RpcFuture<labrpc::Result<T>> + Send,
         FRetry: Fn(&T) -> bool,
     {
-        let leader_index = self.leader_index.load(Ordering::SeqCst);
+        let leader_index = self.leader_index.load(Ordering::Relaxed);
 
         for i in (0..self.servers.len()).cycle().skip(leader_index) {
             self.log(&format!("Sending to server {}", i));
             let value = block_on(async {
                 select! {
                     value = f(i).fuse() => Some(value),
-                    () = Delay::new(Duration::from_millis(200)).fuse() => None,
+                    () = Delay::new(Duration::from_millis(600)).fuse() => None,
                 }
             });
             // let value =
@@ -78,7 +78,7 @@ impl Clerk {
                         continue;
                     } else {
                         self.log(&format!("Server {} is leader. Executed", i));
-                        self.leader_index.store(i, Ordering::SeqCst);
+                        self.leader_index.store(i, Ordering::Relaxed);
                         return reply;
                     }
                 } else {
@@ -101,14 +101,17 @@ impl Clerk {
         // You will have to modify this function.
         // crate::your_code_here(key)
 
-        let args = GetRequest {
+        let args = Request {
+            op: OpType::Get as i32,
             key,
+            value: "".to_string(),
             id: get_and_increment_id(),
+            client_name: self.name.to_string(),
         };
 
         self.log(&format!("Request: {:?}", args));
 
-        let reply = self.execute(|i| self.servers[i].get(&args), |x| x.wrong_leader);
+        let reply = self.execute(|i| self.servers[i].request_op(&args), |x| x.wrong_leader);
 
         reply.value
     }
@@ -120,23 +123,25 @@ impl Clerk {
     fn put_append(&self, op: Op) {
         // You will have to modify this function.
         let args = match op {
-            Op::Append(key, value) => PutAppendRequest {
+            Op::Append(key, value) => Request {
                 key,
                 value,
-                op: crate::proto::kvraftpb::Op::Append as i32,
+                client_name: self.name.to_string(),
+                op: OpType::Append as i32,
                 id: get_and_increment_id(),
             },
-            Op::Put(key, value) => PutAppendRequest {
+            Op::Put(key, value) => Request {
                 key,
                 value,
-                op: crate::proto::kvraftpb::Op::Put as i32,
+                client_name: self.name.to_string(),
+                op: OpType::Put as i32,
                 id: get_and_increment_id(),
             },
         };
 
         self.log(&format!("Request: {:?}", args));
 
-        self.execute(|i| self.servers[i].put_append(&args), |x| x.wrong_leader);
+        self.execute(|i| self.servers[i].request_op(&args), |x| x.wrong_leader);
     }
 
     pub fn put(&self, key: String, value: String) {

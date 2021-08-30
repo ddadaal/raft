@@ -22,8 +22,7 @@ pub mod kvraftpb {
 
     labrpc::service! {
         service kv {
-            rpc get(GetRequest) returns (GetReply);
-            rpc put_append(PutAppendRequest) returns (PutAppendReply);
+            rpc request_op(Request) returns (Reply);
 
             // Your code here if more rpc desired.
             // rpc xxx(yyy) returns (zzz)
