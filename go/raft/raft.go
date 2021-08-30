@@ -318,7 +318,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	// find the index from the back
-	i := 0
+	i := len(rf.log) - 1
 	for ; i >= 0; i-- {
 		if rf.log[i].Index == args.LastIncludedIndex {
 			break
