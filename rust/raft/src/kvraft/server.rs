@@ -37,11 +37,8 @@ pub struct KvServer {
     // every highest committed id for each client
     highest_committed_id: HashMap<String, u64>,
 
-    // key is index, value is (id, result)
-    executed_results: HashMap<u64, (u64, String)>,
-
-    // key is index, value is (id, sender)
-    results: HashMap<u64, (u64, oneshot::Sender<ListenResult>)>,
+    // key is request id, value is sender
+    results: HashMap<u64, oneshot::Sender<ListenResult>>,
 }
 
 impl KvServer {
@@ -66,7 +63,6 @@ impl KvServer {
             latest_index: 0,
             apply_ch: Some(apply_ch),
             highest_committed_id: HashMap::new(),
-            executed_results: HashMap::new(),
             results: HashMap::new(),
         };
 
@@ -77,17 +73,10 @@ impl KvServer {
         println!("{} {}", self.me, log);
     }
 
-    pub fn register(&mut self, request_id: u64, index: u64) -> oneshot::Receiver<ListenResult> {
+    pub fn register(&mut self, request_id: u64) -> oneshot::Receiver<ListenResult> {
         let (sender, receiver) = oneshot::channel();
 
-        if let Some((id, result)) = self.executed_results.get(&index) {
-            if *id == request_id {
-                let (id, result) = self.executed_results.remove(&index).unwrap();
-                sender.send(ListenResult::Completed(result)).unwrap();
-            }
-        } else {
-            self.results.insert(index, (request_id, sender));
-        }
+        self.results.insert(request_id, sender);
 
         receiver
     }
@@ -176,31 +165,29 @@ impl Node {
 
                     let arg = labcodec::decode::<Request>(&message.command).unwrap();
 
-                    // duplicate entry
+                    let arg_id = arg.id;
+
+                    // duplicate entry, sending the result directly
+                    // https://zhuanlan.zhihu.com/p/258338915
                     if let Some(highest_id) = server.highest_committed_id.get(&arg.client_name) {
                         if arg.id <= *highest_id {
+                            if let Some(sender) = server.results.remove(&arg_id) {
+                                if let Some(value) = server.hashmap.get(&arg.key) {
+                                    let _ = sender.send(ListenResult::Completed(value.to_string()));
+                                }
+                            }
                             continue;
                         }
                     }
 
-                    let arg_id = arg.id;
+                    server
+                        .highest_committed_id
+                        .insert(arg.client_name.to_string(), arg.id);
 
-                    if let Some((id, sender)) = server.results.remove(&message.command_index) {
-                        if id != arg_id {
-                            sender.send(ListenResult::LeaderChange);
-                            continue;
-                        }
-                        server
-                            .highest_committed_id
-                            .insert(arg.client_name.to_string(), id);
-                        let value = server.apply_request(arg);
+                    let value = server.apply_request(arg);
 
-                        sender.send(ListenResult::Completed(value.to_string()));
-                    } else {
-                        let value = server.apply_request(arg);
-                        server
-                            .executed_results
-                            .insert(message.command_index, (arg_id, value));
+                    if let Some(sender) = server.results.remove(&arg_id) {
+                        let _ = sender.send(ListenResult::Completed(value.to_string()));
                     }
                 }
             });
@@ -260,16 +247,16 @@ impl KvService for Node {
                 };
             }
 
-            let (index, term) = r.unwrap();
+            // let (index, term) = r.unwrap();
 
-            server.register(id, index)
+            server.register(id)
         };
 
-        let result = rx.await.unwrap();
-        // let result = select! {
-        //     value = rx => value.unwrap(),
-        //     () = Delay::new(Duration::from_millis(500)).fuse() => ListenResult::LeaderChange,
-        // };
+        // let result = rx.await.unwrap();
+        let result = select! {
+            value = rx => value.unwrap(),
+            () = Delay::new(Duration::from_millis(500)).fuse() => ListenResult::LeaderChange,
+        };
 
         Ok(match result {
             ListenResult::Completed(value) => Reply {

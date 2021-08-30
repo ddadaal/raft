@@ -60,7 +60,7 @@ impl Clerk {
         FExecute: Fn(usize) -> RpcFuture<labrpc::Result<T>> + Send,
         FRetry: Fn(&T) -> bool,
     {
-        let leader_index = self.leader_index.load(Ordering::Relaxed);
+        let leader_index = self.leader_index.load(Ordering::SeqCst);
 
         for i in (0..self.servers.len()).cycle().skip(leader_index) {
             self.log(&format!("Sending to server {}", i));
@@ -70,7 +70,7 @@ impl Clerk {
                     () = Delay::new(Duration::from_millis(600)).fuse() => None,
                 }
             });
-            // let value =
+            // let reply = block_on(f(i));
             if let Some(reply) = value {
                 if let Ok(reply) = reply {
                     if retry(&reply) {
@@ -78,7 +78,7 @@ impl Clerk {
                         continue;
                     } else {
                         self.log(&format!("Server {} is leader. Executed", i));
-                        self.leader_index.store(i, Ordering::Relaxed);
+                        self.leader_index.store(i, Ordering::SeqCst);
                         return reply;
                     }
                 } else {
