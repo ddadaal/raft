@@ -553,7 +553,7 @@ impl Node {
     pub fn should_snapshot(&self, max_size: usize) -> bool {
         let rf = self.raft.lock().unwrap();
 
-        rf.role == RaftRole::Leader && rf.log_size() > max_size
+        rf.role == RaftRole::Leader && rf.persister.raft_state().len() >= max_size
     }
 
     pub fn snapshot(&self, index: u64, snapshot: Vec<u8>) {
@@ -593,27 +593,28 @@ impl Node {
 
         rf.snapshot_log(&format!("Snapshot to {} completed", index));
 
-        // install snapshot to all followers
+        // install snapshot to all followers now
+        // might be optional, but must add to pass the 2rd test of 3b
 
-        // let mut tasks = FuturesUnordered::from_iter(
-        //     rf.peers
-        //         .iter()
-        //         .enumerate()
-        //         .filter(|(i, _)| *i != rf.me)
-        //         .map(|(_, client)| {
-        //             client.install_snapshot(&InstallSnapshotArgs {
-        //                 last_included_index: index as u64,
-        //                 last_included_term: term,
-        //                 leader_id: rf.me as u64,
-        //                 term: rf.current_term,
-        //                 data: snapshot.clone(),
-        //             })
-        //         }),
-        // );
+        let mut tasks = FuturesUnordered::from_iter(
+            rf.peers
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != rf.me)
+                .map(|(_, client)| {
+                    client.install_snapshot(&InstallSnapshotArgs {
+                        last_included_index: index as u64,
+                        last_included_term: term,
+                        leader_id: rf.me as u64,
+                        term: rf.current_term,
+                        data: snapshot.clone(),
+                    })
+                }),
+        );
 
-        // thread::spawn(move || {
-        //     block_on(async { while let Some(_) = tasks.next().await {} });
-        // });
+        thread::spawn(move || {
+            block_on(async { while let Some(_) = tasks.next().await {} });
+        });
     }
 
     async fn append_entries_loop(&mut self) {
