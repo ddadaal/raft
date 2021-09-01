@@ -193,21 +193,32 @@ impl Raft {
         }
         // Your code here (2C).
         // Example:
-        match labcodec::decode::<PersistedState>(data) {
-            Ok(o) => {
-                self.current_term = o.current_term;
-                self.voted_for = o.voted_for as isize;
-                // first item is dummy
-                self.log.extend_from_slice(&o.log[1..]);
-                self.snapshot_last_index = o.snapshot_last_index as usize;
-                self.snapshot_last_term = o.snapshot_last_term;
-                self.last_applied = o.snapshot_last_index as usize;
-                self.commit_index = o.snapshot_last_index as usize;
-            }
-            Err(e) => {
-                panic!("{:?}", e);
-            }
-        }
+        let o = labcodec::decode::<PersistedState>(data).unwrap();
+        self.current_term = o.current_term;
+        self.voted_for = o.voted_for as isize;
+        // first item is dummy
+        self.log.extend_from_slice(&o.log[1..]);
+        self.snapshot_last_index = o.snapshot_last_index as usize;
+        self.snapshot_last_term = o.snapshot_last_term;
+        self.last_applied = o.snapshot_last_index as usize;
+        self.commit_index = o.snapshot_last_index as usize;
+
+        let mut apply_ch = self.apply_ch.clone();
+        let snapshot = self.persister.snapshot();
+
+        // apply the snapshot
+        thread::spawn(move || {
+            block_on(async {
+                let _ = apply_ch
+                    .send(ApplyMsg {
+                        command_valid: false,
+                        command_index: o.snapshot_last_index,
+                        command_term: o.snapshot_last_term,
+                        command: snapshot,
+                    })
+                    .await;
+            });
+        });
     }
 
     /// example code to send a RequestVote RPC to a server.
