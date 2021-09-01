@@ -1,4 +1,5 @@
 use std::cmp::min;
+use std::iter::FromIterator;
 use std::mem::size_of_val;
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::{Arc, Mutex};
@@ -158,6 +159,11 @@ impl Raft {
         rf
     }
 
+    pub fn log_size(&self) -> usize {
+        // https://stackoverflow.com/questions/62613488/how-do-i-get-the-runtime-memory-size-of-an-object
+        size_of_val(&*self.log)
+    }
+
     /// save Raft's persistent state to stable storage,
     /// where it can later be retrieved after a crash and restart.
     /// see paper's Figure 2 for a description of what should be persistent.
@@ -291,6 +297,10 @@ impl Raft {
         // println!("{} [{}] {}", self.me, self.current_term, info);
     }
 
+    fn snapshot_log(&self, info: &str) {
+        println!("{} [{}] {}", self.me, self.current_term, info);
+    }
+
     fn to_follower(&mut self, term: Term) {
         self.role = RaftRole::Follower;
         self.current_term = term;
@@ -310,10 +320,17 @@ impl Raft {
     }
 
     fn last_log(&self) -> LastLogInfo {
-        let last_log = self.log.last().unwrap();
-        LastLogInfo {
-            index: last_log.index as usize,
-            term: last_log.term,
+        if self.log.len() > 1 {
+            let last_log = self.log.last().unwrap();
+            LastLogInfo {
+                index: last_log.index as usize,
+                term: last_log.term,
+            }
+        } else {
+            LastLogInfo {
+                index: self.snapshot_last_index,
+                term: self.snapshot_last_term,
+            }
         }
     }
 
@@ -533,44 +550,70 @@ impl Node {
         // Your code here, if desired.
     }
 
-    /// Log size in bytes
-    pub fn log_size(&self) -> usize {
+    pub fn should_snapshot(&self, max_size: usize) -> bool {
         let rf = self.raft.lock().unwrap();
 
-        // https://stackoverflow.com/questions/62613488/how-do-i-get-the-runtime-memory-size-of-an-object
-        size_of_val(&*rf.log)
+        rf.role == RaftRole::Leader && rf.log_size() > max_size
     }
 
-    pub fn snapshot_to_latest(&self) {
+    pub fn snapshot(&self, index: u64, snapshot: Vec<u8>) {
         let mut rf = self.raft.lock().unwrap();
 
         if rf.log.len() == 1 {
-            rf.log(&format!("No log exists. Don't snapshot."));
+            rf.snapshot_log(&format!("No log exists. Don't snapshot."));
             return;
         }
 
-        rf.log(&format!(
-            "Handling snapshot to commited log. Removing all logs."
-        ));
+        rf.snapshot_log(&format!("Making snapshot to {}", index));
 
         let actual_index = rf
             .log
             .iter()
             .rev()
-            .position(|x| x.index == rf.commit_index as u64)
-            .unwrap();
+            .position(|l| l.index == index as u64)
+            .map(|x| rf.log.len() - 1 - x);
 
-        rf.snapshot_last_index = rf.log[actual_index].index as usize;
-        rf.snapshot_last_term = rf.log[actual_index].term;
+        if actual_index.is_none() {
+            rf.snapshot_log(&format!("Didn't find index log with {}", index));
+            return;
+        }
+
+        let actual_index = actual_index.unwrap();
 
         let removed_logs = rf.log.drain(1..actual_index + 1).collect::<Vec<_>>();
 
-        let mut buf = Vec::new();
-        labcodec::encode(&Snapshot { log: removed_logs }, &mut buf).unwrap();
+        let term = removed_logs.last().unwrap().term;
+
+        rf.snapshot_last_index = index as usize;
+        rf.snapshot_last_term = term;
 
         rf.persist();
         rf.persister
-            .save_state_and_snapshot(rf.persister.raft_state(), buf);
+            .save_state_and_snapshot(rf.persister.raft_state(), snapshot.clone());
+
+        rf.snapshot_log(&format!("Snapshot to {} completed", index));
+
+        // install snapshot to all followers
+
+        // let mut tasks = FuturesUnordered::from_iter(
+        //     rf.peers
+        //         .iter()
+        //         .enumerate()
+        //         .filter(|(i, _)| *i != rf.me)
+        //         .map(|(_, client)| {
+        //             client.install_snapshot(&InstallSnapshotArgs {
+        //                 last_included_index: index as u64,
+        //                 last_included_term: term,
+        //                 leader_id: rf.me as u64,
+        //                 term: rf.current_term,
+        //                 data: snapshot.clone(),
+        //             })
+        //         }),
+        // );
+
+        // thread::spawn(move || {
+        //     block_on(async { while let Some(_) = tasks.next().await {} });
+        // });
     }
 
     async fn append_entries_loop(&mut self) {
@@ -712,7 +755,7 @@ impl Node {
             }
 
             if rf.next_index[i] - 1 < rf.snapshot_last_index {
-                rf.log(&format!(
+                rf.snapshot_log(&format!(
                     "{} is too laggy {} < {}. InstallSnapshot",
                     i,
                     rf.next_index[i] - 1,
@@ -988,7 +1031,7 @@ impl RaftService for Node {
     ) -> labrpc::Result<InstallSnapshotReply> {
         let mut rf = self.raft.lock().unwrap();
 
-        rf.log(&format!("Handling InstallSnapshot"));
+        rf.snapshot_log(&format!("Handling InstallSnapshot"));
 
         let reply = InstallSnapshotReply {
             term: rf.current_term,
@@ -1004,35 +1047,33 @@ impl RaftService for Node {
         }
 
         if args.last_included_index < (rf.snapshot_last_index as u64) {
-            rf.log(&format!(
+            rf.snapshot_log(&format!(
                 "Received a outdated snapshot. Last index {} < {}",
                 args.last_included_index, rf.snapshot_last_index
             ));
         }
 
         // find the index from the back
-        let mut index = 0;
+        let index = rf
+            .log
+            .iter()
+            .rev()
+            .position(|l| l.index == args.last_included_index as u64)
+            .map(|x| rf.log.len() - 1 - x);
 
-        for i in rf.log.len() - 1..0 {
-            if rf.log[i].index == args.last_included_index {
-                index = i;
-                break;
-            }
-        }
-
-        if index <= 0 {
+        if index.is_none() {
             if (rf.snapshot_last_index as u64) == args.last_included_index {
                 if rf.snapshot_last_term == args.last_included_term {
-                    rf.log(&format!(
+                    rf.snapshot_log(&format!(
                         "The snapshot to {} is already token",
                         rf.snapshot_last_index
                     ));
                 } else {
-                    rf.log(&format!("Snapshot index matches, but term doesn't match."));
+                    rf.snapshot_log(&format!("Snapshot index matches, but term doesn't match."));
                     unreachable!()
                 }
             } else {
-                rf.log(&format!(
+                rf.snapshot_log(&format!(
                     "The snapshot to {} is not found. Removing all logs.",
                     rf.snapshot_last_index
                 ));
@@ -1042,7 +1083,8 @@ impl RaftService for Node {
                 rf.log.drain(1..);
             }
         } else {
-            rf.log(&format!(
+            let index = index.unwrap();
+            rf.snapshot_log(&format!(
                 "Removing logs until index {}",
                 args.last_included_index
             ));
@@ -1054,17 +1096,32 @@ impl RaftService for Node {
         rf.last_applied = args.last_included_index as usize;
         rf.commit_index = args.last_included_index as usize;
 
-        rf.log(&format!(
+        rf.snapshot_log(&format!(
             "Snapshot installed to {}",
             args.last_included_index
         ));
 
         rf.persist();
         rf.persister
-            .save_state_and_snapshot(rf.persister.raft_state(), args.data);
+            .save_state_and_snapshot(rf.persister.raft_state(), args.data.clone());
+
+        let mut apply_ch = rf.apply_ch.clone();
+
+        // notify the client
+        thread::spawn(move || {
+            block_on(async {
+                let _ = apply_ch
+                    .send(ApplyMsg {
+                        command_valid: false,
+                        command_index: args.last_included_index,
+                        command_term: args.last_included_term,
+                        command: args.data,
+                    })
+                    .await;
+            });
+        });
 
         rf.reset_last_heard();
-
         Ok(reply)
     }
 }

@@ -63,7 +63,8 @@ impl Clerk {
         let leader_index = self.leader_index.load(Ordering::SeqCst);
 
         for i in (0..self.servers.len()).cycle().skip(leader_index) {
-            self.log(&format!("Sending to server {}", i));
+            // thread::sleep(Duration::from_millis(500));
+            // self.log(&format!("Sending to server {}", i));
             let value = block_on(async {
                 select! {
                     value = f(i).fuse() => Some(value),

@@ -31,7 +31,6 @@ pub struct KvServer {
     maxraftstate: Option<usize>,
     // Your definitions here.
     hashmap: HashMap<String, String>,
-    latest_index: u64,
     apply_ch: Option<UnboundedReceiver<ApplyMsg>>,
 
     // every highest committed id for each client
@@ -60,7 +59,6 @@ impl KvServer {
             me,
             maxraftstate,
             hashmap: HashMap::new(),
-            latest_index: 0,
             apply_ch: Some(apply_ch),
             highest_committed_id: HashMap::new(),
             results: HashMap::new(),
@@ -162,41 +160,71 @@ impl Node {
 
                     server.log(&format!("Received commit index {}", message.command_index));
 
-                    if let Some(max_state_size) = max_state_size {
-                        if server.rf.log_size() > max_state_size {
-                            server.log(&format!("Should snapshot."));
+                    if message.command_valid {
+                        let arg = labcodec::decode::<Request>(&message.command).unwrap();
 
-                            server.rf.snapshot_to_latest();
-                        }
-                    }
+                        let arg_id = arg.id;
 
-                    server.latest_index = message.command_index;
-
-                    let arg = labcodec::decode::<Request>(&message.command).unwrap();
-
-                    let arg_id = arg.id;
-
-                    // duplicate entry, sending the result directly
-                    // https://zhuanlan.zhihu.com/p/258338915
-                    if let Some(highest_id) = server.highest_committed_id.get(&arg.client_name) {
-                        if arg.id <= *highest_id {
-                            if let Some(sender) = server.results.remove(&arg_id) {
-                                if let Some(value) = server.hashmap.get(&arg.key) {
-                                    let _ = sender.send(ListenResult::Completed(value.to_string()));
+                        // duplicate entry, sending the result directly
+                        // https://zhuanlan.zhihu.com/p/258338915
+                        if let Some(highest_id) = server.highest_committed_id.get(&arg.client_name)
+                        {
+                            if arg.id <= *highest_id {
+                                if let Some(sender) = server.results.remove(&arg_id) {
+                                    if let Some(value) = server.hashmap.get(&arg.key) {
+                                        let _ =
+                                            sender.send(ListenResult::Completed(value.to_string()));
+                                    }
                                 }
+                                continue;
                             }
-                            continue;
                         }
-                    }
 
-                    server
-                        .highest_committed_id
-                        .insert(arg.client_name.to_string(), arg.id);
+                        server
+                            .highest_committed_id
+                            .insert(arg.client_name.to_string(), arg.id);
 
-                    let value = server.apply_request(arg);
+                        let value = server.apply_request(arg);
 
-                    if let Some(sender) = server.results.remove(&arg_id) {
-                        let _ = sender.send(ListenResult::Completed(value.to_string()));
+                        if let Some(sender) = server.results.remove(&arg_id) {
+                            let _ = sender.send(ListenResult::Completed(value.to_string()));
+                        }
+
+                        if let Some(max_state_size) = max_state_size {
+                            if server.rf.should_snapshot(max_state_size) {
+                                server.log(&format!(
+                                    "Making snapshot to index {}",
+                                    message.command_index
+                                ));
+
+                                // snapshot current hashmap
+                                let mut buf = Vec::new();
+                                labcodec::encode(
+                                    &Snapshot {
+                                        kv: server.hashmap.clone(),
+                                        highest_committed_id: server.highest_committed_id.clone(),
+                                    },
+                                    &mut buf,
+                                )
+                                .unwrap();
+
+                                // save snapshot
+                                server.rf.snapshot(message.command_index, buf);
+                            }
+                        }
+                    } else {
+                        // is snapshot. update snapshot
+                        let snapshot = labcodec::decode::<Snapshot>(&message.command).unwrap();
+
+                        // update the hashmap
+                        server.hashmap.clear();
+                        server.hashmap.extend(snapshot.kv.into_iter());
+
+                        // update highest_committed_id
+                        server.highest_committed_id.clear();
+                        server
+                            .highest_committed_id
+                            .extend(snapshot.highest_committed_id.into_iter());
                     }
                 }
             });
@@ -256,7 +284,11 @@ impl KvService for Node {
                 };
             }
 
-            // let (index, term) = r.unwrap();
+            let (index, term) = r.unwrap();
+            server.log(&format!(
+                "Command id {} is inserted into raft. index {}, term {}",
+                id, index, term
+            ));
 
             server.register(id)
         };
