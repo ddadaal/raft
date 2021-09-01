@@ -37,7 +37,7 @@ pub struct KvServer {
     highest_committed_id: HashMap<String, u64>,
 
     // key is request id, value is sender
-    results: HashMap<u64, oneshot::Sender<ListenResult>>,
+    listeners: HashMap<u64, oneshot::Sender<ListenResult>>,
 }
 
 impl KvServer {
@@ -61,7 +61,7 @@ impl KvServer {
             hashmap: HashMap::new(),
             apply_ch: Some(apply_ch),
             highest_committed_id: HashMap::new(),
-            results: HashMap::new(),
+            listeners: HashMap::new(),
         };
 
         server
@@ -74,7 +74,7 @@ impl KvServer {
     pub fn register(&mut self, request_id: u64) -> oneshot::Receiver<ListenResult> {
         let (sender, receiver) = oneshot::channel();
 
-        self.results.insert(request_id, sender);
+        self.listeners.insert(request_id, sender);
 
         receiver
     }
@@ -170,7 +170,7 @@ impl Node {
                         if let Some(highest_id) = server.highest_committed_id.get(&arg.client_name)
                         {
                             if arg.id <= *highest_id {
-                                if let Some(sender) = server.results.remove(&arg_id) {
+                                if let Some(sender) = server.listeners.remove(&arg_id) {
                                     if let Some(value) = server.hashmap.get(&arg.key) {
                                         let _ =
                                             sender.send(ListenResult::Completed(value.to_string()));
@@ -186,7 +186,7 @@ impl Node {
 
                         let value = server.apply_request(arg);
 
-                        if let Some(sender) = server.results.remove(&arg_id) {
+                        if let Some(sender) = server.listeners.remove(&arg_id) {
                             let _ = sender.send(ListenResult::Completed(value.to_string()));
                         }
 
