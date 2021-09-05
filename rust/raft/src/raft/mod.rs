@@ -545,7 +545,9 @@ impl Node {
         // self.raft.start(command)
         let mut rf = self.raft.lock().unwrap();
         let result = rf.start(command);
-        // self.broadcast(rf);
+        if result.is_ok() {
+            self.broadcast(rf);
+        }
         result
     }
 
