@@ -68,7 +68,7 @@ impl KvServer {
     }
 
     fn log(&self, log: &str) {
-        println!("{} {}", self.me, log);
+        debug!("{} {}", self.me, log);
     }
 
     pub fn register(&mut self, request_id: u64) -> oneshot::Receiver<ListenResult> {

@@ -52,7 +52,7 @@ impl Clerk {
     }
 
     fn log(&self, log: &str) {
-        println!("Clerk {}: {}", self.name, log);
+        debug!("Clerk {}: {}", self.name, log);
     }
 
     fn execute<FExecute, FRetry, T>(&self, f: FExecute, retry: FRetry) -> T

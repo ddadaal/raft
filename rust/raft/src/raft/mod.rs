@@ -327,11 +327,11 @@ impl Raft {
     }
 
     fn log(&self, info: &str) {
-        // println!("{} [{}] {}", self.me, self.current_term, info);
+        trace!("{} [{}] {}", self.me, self.current_term, info);
     }
 
     fn snapshot_log(&self, info: &str) {
-        println!("{} [{}] {}", self.me, self.current_term, info);
+        debug!("{} [{}] {}", self.me, self.current_term, info);
     }
 
     fn to_follower(&mut self, term: Term) {
