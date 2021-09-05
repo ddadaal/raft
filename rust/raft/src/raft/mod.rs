@@ -1,9 +1,9 @@
-use std::cmp::min;
+use std::cmp::{max, min};
 use std::iter::FromIterator;
 use std::mem::size_of_val;
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::{Arc, Mutex};
-use std::thread::{self};
+use std::thread::{self, spawn};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::channel::mpsc::{unbounded, UnboundedSender};
@@ -159,6 +159,8 @@ impl Raft {
         rf
     }
 
+    fn apply_snapshot(&self) {}
+
     pub fn log_size(&self) -> usize {
         // https://stackoverflow.com/questions/62613488/how-do-i-get-the-runtime-memory-size-of-an-object
         size_of_val(&*self.log)
@@ -289,6 +291,26 @@ impl Raft {
         Ok((index, term))
     }
 
+    pub fn update_indexes_after_install_snapshot(
+        &mut self,
+        request_term: u64,
+        reply_term: u64,
+        i: usize,
+        last_included_index: u64,
+    ) {
+        if self.current_term != request_term {
+            return;
+        }
+        if reply_term > self.current_term {
+            self.to_follower(reply_term);
+            return;
+        }
+
+        self.next_index[i] = (last_included_index + 1) as usize;
+        self.match_index[i] = last_included_index as usize;
+        self.try_commit();
+    }
+
     fn start<M>(&mut self, command: &M) -> Result<(u64, u64)>
     where
         M: labcodec::Message,
@@ -359,6 +381,7 @@ impl Raft {
 
     fn commit_message(&mut self, to: usize) {
         self.commit_index = to;
+
         self.log(&format!("commit_index to {}", to));
 
         if self.commit_index > self.last_applied {
@@ -520,7 +543,10 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.start(command)
-        self.raft.lock().unwrap().start(command)
+        let mut rf = self.raft.lock().unwrap();
+        let result = rf.start(command);
+        // self.broadcast(rf);
+        result
     }
 
     /// The current term of this peer.
@@ -564,7 +590,7 @@ impl Node {
     pub fn should_snapshot(&self, max_size: usize) -> bool {
         let rf = self.raft.lock().unwrap();
 
-        rf.role == RaftRole::Leader && rf.persister.raft_state().len() >= max_size
+        rf.role == RaftRole::Leader && rf.persister.raft_state().len() >= max_size / 2
     }
 
     pub fn snapshot(&self, index: u64, snapshot: Vec<u8>) {
@@ -607,25 +633,38 @@ impl Node {
         // install snapshot to all followers now
         // might be optional, but must add to pass the 2rd test of 3b
 
-        let mut tasks = FuturesUnordered::from_iter(
-            rf.peers
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != rf.me)
-                .map(|(_, client)| {
-                    client.install_snapshot(&InstallSnapshotArgs {
-                        last_included_index: index as u64,
-                        last_included_term: term,
-                        leader_id: rf.me as u64,
-                        term: rf.current_term,
-                        data: snapshot.clone(),
-                    })
-                }),
-        );
+        // also update the nextIndex and matchIndex
 
-        thread::spawn(move || {
-            block_on(async { while let Some(_) = tasks.next().await {} });
-        });
+        for (i, client) in rf.peers.iter().enumerate().filter(|(i, _)| *i != rf.me) {
+            let client = client.clone();
+            let me = rf.me as u64;
+            let current_term = rf.current_term;
+            let snapshot = snapshot.clone();
+            let raft = self.raft.clone();
+            thread::spawn(move || {
+                block_on(async {
+                    let reply = client
+                        .install_snapshot(&InstallSnapshotArgs {
+                            last_included_index: index as u64,
+                            last_included_term: term,
+                            leader_id: me as u64,
+                            term: current_term,
+                            data: snapshot,
+                        })
+                        .await;
+
+                    if let Ok(reply) = reply {
+                        let mut rf = raft.lock().unwrap();
+                        rf.update_indexes_after_install_snapshot(
+                            current_term,
+                            reply.term,
+                            i,
+                            index,
+                        );
+                    }
+                });
+            });
+        }
     }
 
     async fn append_entries_loop(&mut self) {
@@ -785,11 +824,22 @@ impl Node {
                     data: rf.persister.snapshot(),
                 };
 
+                let raft = self.raft.clone();
                 let client = client.clone();
 
                 thread::spawn(move || {
                     block_on(async {
-                        let _ = client.install_snapshot(&args).await;
+                        let resp = client.install_snapshot(&args).await;
+
+                        if let Ok(reply) = resp {
+                            let mut rf = raft.lock().unwrap();
+                            rf.update_indexes_after_install_snapshot(
+                                args.term,
+                                reply.term,
+                                i,
+                                last_included_index,
+                            );
+                        }
                     });
                 });
                 continue;
@@ -936,11 +986,7 @@ impl RaftService for Node {
     async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
         let mut rf = self.raft.lock().unwrap();
 
-        rf.log(&format!(
-            "Handling AppendEntries from leader {}. Log size {}",
-            args.leader_id,
-            args.entries.len(),
-        ));
+        rf.snapshot_log(&format!("Handling AppendEntries.{:?}", args));
 
         let mut reply = AppendEntriesReply {
             term: rf.current_term,
@@ -965,7 +1011,9 @@ impl RaftService for Node {
 
         rf.leader = Some(args.leader_id);
 
-        if ((rf.log.len() + rf.snapshot_last_index) as u64) <= args.prev_log_index {
+        if (args.prev_log_index as usize) < rf.snapshot_last_index
+            || ((rf.log.len() + rf.snapshot_last_index) as u64) <= args.prev_log_index
+        {
             rf.log("Doesn't have PrevLogIndex. Rejects");
             reply.conflicting_entry_term = -1;
             reply.first_index_for_term = (rf.last_log().index + 1) as i64;
@@ -1063,6 +1111,7 @@ impl RaftService for Node {
                 "Received a outdated snapshot. Last index {} < {}",
                 args.last_included_index, rf.snapshot_last_index
             ));
+            return Ok(reply);
         }
 
         // find the index from the back
